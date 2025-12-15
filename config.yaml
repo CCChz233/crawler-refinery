@@ -1,0 +1,181 @@
+# ============================================
+# 业务配置文件
+# ============================================
+# 此文件包含所有非敏感的业务配置
+# 敏感信息（API密钥等）请放在 .env 文件中
+
+# ============================================
+# 数据处理配置
+# ============================================
+processing:
+  # 视角：management/market/sales/product
+  view: management
+  # 扫描最近 N 天
+  days: 30
+  # 每批处理条数
+  batch_size: 40
+  # 最大批次数
+  max_batches: 10
+  # 每条间隔秒数
+  sleep_sec: 0.8
+  # 强制刷新（true/false）
+  force_refresh: false
+  # 调试模式（true/false）
+  debug: false
+  # 噪声过滤（true/false）
+  enable_noise_filter: false
+  # 运行模式：daily/weekly/monthly
+  mode: daily
+
+# ============================================
+# 数据表配置
+# ============================================
+tables:
+  # 源表名称
+  analysis_table: fact_events
+  # 目标表名称
+  fact_ddr_table: dashboard_daily_events
+  monthly_table: dashboard_daily_events
+  monthly_source_table: fact_events
+  # 原始数据表
+  raw_news_table: "00_news"
+  raw_opportunity_table: "00_opportunity"
+  competitors_table: "00_competitors"
+  # 目标表
+  daily_reports_table: dashboard_daily_reports
+  weekly_reports_table: dashboard_weekly_reports
+  news_summaries_table: news_summaries
+  opportunity_insights_table: opportunity_insights
+
+# ============================================
+# 月度汇总配置
+# ============================================
+monthly:
+  # 月度汇总天数
+  days: 30
+  # 月度汇总限制
+  limit: 10
+  # 月度汇总文本最大长度
+  summary_max_length: 1000
+
+# ============================================
+# 模型配置
+# ============================================
+models:
+  # 大模型配置（火山引擎）
+  llm:
+    model: deepseek-v3-1-terminus
+    temperature: 0.0
+    endpoint: https://ark.cn-beijing.volces.com/api/v3
+  # Embedding 模型配置（Qwen）
+  embedding:
+    model: text-embedding-v4
+    dimensions: 1024
+
+# ============================================
+# 视图配置
+# ============================================
+views:
+  unified_view: v_events_ready
+  dim_cn_region: dim_cn_region
+  dim_country: dim_country
+
+# ============================================
+# 调度器配置
+# ============================================
+scheduler:
+  # 是否启用调度器
+  enabled: true
+  # 时区设置
+  timezone: "Asia/Shanghai"
+  # 日志目录
+  log_dir: logs
+
+  # ---------- 默认配置 ----------
+  defaults:
+    # 默认任务超时（秒）
+    timeout: 3600
+    # 默认 misfire 容错时间（秒）
+    misfire_grace_time: 300
+    # 默认最大实例数
+    max_instances: 1
+    # 默认处理天数
+    days: 7
+    # 默认批次大小
+    batch_size: 40
+    # 默认最大批次数
+    max_batches: 10
+
+  # ---------- 并发控制 ----------
+  concurrency:
+    # 全局最大并发任务数（1=串行最稳定，0=不限制）
+    max_workers: 1
+
+  # ---------- 重试策略 ----------
+  retry:
+    # 是否启用重试
+    enabled: true
+    # 默认最大重试次数
+    max_attempts: 2
+    # 初始重试间隔（秒）
+    initial_delay: 60
+    # 退避乘数（2=指数退避：60s → 120s）
+    backoff_multiplier: 2
+    # 最大重试间隔（秒）
+    max_delay: 300
+
+  # ---------- 任务配置 ----------
+  jobs:
+    # 新闻处理任务
+    news_process:
+      enabled: true
+      cron: "0 8 * * *"           # 每天早上 8 点
+      script: "scripts/news_process.py"
+      days: 7                      # 处理最近 7 天的数据
+      batch_size: 40               # 每批处理条数
+      max_batches: 10              # 最大批次数
+      timeout: 1800                # 30 分钟超时
+      retry_on_fail: true          # 失败时重试
+
+    # 商机处理任务
+    opportunity_process:
+      enabled: true
+      cron: "0 9 * * *"           # 每天早上 9 点
+      script: "scripts/opportunity-process.py"
+      days: 7                      # 处理最近 7 天的数据
+      batch_size: 40
+      max_batches: 10
+      timeout: 1800
+      retry_on_fail: true
+
+    # 数据板映射任务（增量，高频）
+    databoard_map_hourly:
+      enabled: true
+      cron: "30 * * * *"          # 每小时 30 分
+      script: "scripts/databoard-map-process.py"
+      days: 1                      # 只处理最近 1 天（增量）
+      batch_size: 20
+      max_batches: 20
+      timeout: 2400                # 40 分钟超时
+      retry_on_fail: true
+
+    # 日报生成任务
+    daily_report:
+      enabled: true
+      cron: "0 23 * * *"          # 每天晚上 11 点
+      script: "scripts/daily-report-process.py"
+      days: 30                     # 汇总最近 30 天
+      timeout: 3600
+      retry_on_fail: true
+
+    # 每周 Embedding 回填任务
+    backfill_embeddings_weekly:
+      enabled: false               # 默认关闭，按需开启
+      cron: "0 2 * * 0"           # 每周日凌晨 2 点
+      script: "scripts/backfill-embeddings.py"
+      days: 7                      # 回填最近 7 天
+      batch_size: 50
+      max_batches: 100
+      timeout: 7200                # 2 小时超时
+      retry_on_fail: false         # 回填任务不重试
+

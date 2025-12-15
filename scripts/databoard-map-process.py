@@ -2,7 +2,7 @@
 """
 Unified Events → Facts (Qwen3 + Supabase)  — 方案B风格（精简 .env + 命令行参数）
 ----------------------------------------------------
-- 仅允许在 .env 里配置 4 个键：SUPABASE_URL、SUPABASE_SERVICE_KEY、QWEN_API_KEY、QWEN_MODEL；
+- 仅允许在 .env 里配置：SUPABASE_URL、SUPABASE_SERVICE_KEY、VOLCANO_API_TOKEN、LLM_MODEL；
   其它运行参数（时间窗、批次大小、端点区域等）全部用命令行参数 --args 指定。
 - 示例：
   python databoard-map-process.py --days 7 --batch-size 15 --sleep 0.2 --region cn --fact-table fact_events
@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from postgrest.exceptions import APIError  # type: ignore
+from embedding_utils import build_fact_event_embedding
 
 # 视图内的四类来源（来自 v_source_events / v_events_geocoded）
 VIEW_SOURCE_TYPES = {"news", "competitor", "opportunity", "paper"}
@@ -37,25 +38,31 @@ if _DOTENV_AVAILABLE:
         load_dotenv(_dotenv_path, override=True)
 
 
-# ---------------- 基本密钥仅来自 .env/环境变量（其余走命令行参数） ----------------
+# ---------------- 配置加载 ----------------
 import requests
 from dateutil import parser as dateparser
 from supabase import create_client, Client
-SUPABASE_URL = os.environ.get("SUPABASE_URL") or "https://YOUR-PROJECT.supabase.co"
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY") or "YOUR_SERVICE_ROLE_KEY"
-QWEN_API_KEY = os.environ.get("QWEN_API_KEY") or "YOUR_QWEN_API_KEY"
-QWEN_MODEL   = os.environ.get("QWEN_MODEL") or "qwen3-72b-instruct"  # 用它来选择大模型
+from config_loader import config
 
-# 运行参数的默认值（会被命令行参数覆盖）
-DASHSCOPE_REGION    = "cn"
-QWEN_OPENAI_COMPAT  = True
-BATCH_SIZE          = 20
-MAX_BATCHES         = 20
-SLEEP_BETWEEN_CALLS = 0.4
+# 从 .env 加载敏感信息
+SUPABASE_URL = config.supabase_url or "https://YOUR-PROJECT.supabase.co"
+SUPABASE_KEY = config.supabase_key or "YOUR_SERVICE_ROLE_KEY"
+# 火山引擎 API 配置（用于大模型调用）
+VOLCANO_API_TOKEN = config.volcano_api_token or ""
+VOLCANO_API_ENDPOINT = config.llm_endpoint
+LLM_MODEL = config.llm_model
+LLM_TEMPERATURE = config.llm_temperature
+# Qwen API 配置（仅用于 Embedding，此脚本不使用）
+QWEN_API_KEY = config.qwen_api_key or ""
+
+# 运行参数的默认值（从 config.yaml 读取，会被命令行参数覆盖）
+BATCH_SIZE          = config.batch_size
+MAX_BATCHES         = config.max_batches
+SLEEP_BETWEEN_CALLS = config.sleep_sec
 DAYS_WINDOW         = ""  # 由 --days 设置
-UNIFIED_VIEW        = "v_events_ready"
-DIM_CN_REGION       = "dim_cn_region"
-DIM_COUNTRY         = "dim_country"
+UNIFIED_VIEW        = config.unified_view
+DIM_CN_REGION       = config.dim_cn_region
+DIM_COUNTRY         = config.dim_country
 STATE_FILE          = ".databoard_map_state.json"
 GEO_BY_LLM          = True
 LOG_LLM             = False
@@ -63,16 +70,16 @@ LOG_GEO             = False
 SUMMARY_PREVIEW_CHARS = 120
 
 # 关键敏感变量校验
-_missing = [k for k,v in {"SUPABASE_SERVICE_KEY": SUPABASE_KEY, "QWEN_API_KEY": QWEN_API_KEY}.items() if not v]
+_missing = [k for k,v in {"SUPABASE_SERVICE_KEY": SUPABASE_KEY, "VOLCANO_API_TOKEN": VOLCANO_API_TOKEN}.items() if not v]
 if _missing:
-    raise SystemExit(f"缺少关键配置：{', '.join(_missing)}。请在 .env / 环境变量中提供。")
+    raise SystemExit(f"缺少关键配置：{', '.join(_missing)}。请在 .env 文件中提供。")
 
 
 # ---------------- 命令行参数（覆盖运行行为） ----------------
 import argparse
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Unified Events → Facts (Qwen3 + Supabase)")
+    p = argparse.ArgumentParser(description="Unified Events → Facts (Volcano Engine LLM + Supabase)")
     p.add_argument("--days", type=int, default=7, help="仅处理近N天（示例：7、3；默认不过滤）")
     p.add_argument("--batch-size", type=int, default=20, help="每批处理条数")
     p.add_argument("--max-batches", type=int, default=20, help="最多处理批次数")
@@ -81,9 +88,6 @@ def parse_args():
     p.add_argument("--dim-cn-region", default="dim_cn_region")
     p.add_argument("--dim-country", default="dim_country")
     p.add_argument("--fact-table", default="fact_events")
-    p.add_argument("--region", default="cn", choices=["cn","intl","finance"], help="大模型区域端点")
-    p.add_argument("--openai-compat", dest="openai_compat", action="store_true", help="使用兼容接口（默认开）")
-    p.add_argument("--no-openai-compat", dest="openai_compat", action="store_false", help="关闭兼容接口")
     p.add_argument("--include-types", default="", help="仅处理这些类型，逗号分隔（可选：news,competitor,opportunity,paper）")
     p.add_argument("--exclude-types", default="", help="排除这些类型，逗号分隔（可选：news,competitor,opportunity,paper）")
     p.add_argument("--geo-by-llm", dest="geo_by_llm", action="store_true", help="优先使用大模型从文本判断国家/省份")
@@ -118,12 +122,7 @@ try:
 except Exception:
     pass
 
-# ---------------- Qwen 兼容接口封装 ----------------
-DASHSCOPE_COMPAT_BASES = {
-    "cn": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "intl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-    "finance": "https://dashscope-finance.aliyuncs.com/compatible-mode/v1",
-}
+# ---------------- 火山引擎 API 封装 ----------------
 
 def _strip_code_fence_to_json(s: str) -> dict:
     s = (s or "").strip()
@@ -155,27 +154,27 @@ PROMPT_SUMMARY = (
     "请避免臆测；当无法判断时，对应字段置为 null。禁止输出除 JSON 以外的任何内容。"
 )
 
-def qwen_summary(payload: Dict[str, Any], timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
-    """调用 /chat/completions，返回 {summary, keywords}，强制 JSON。"""
-    base = DASHSCOPE_COMPAT_BASES.get(DASHSCOPE_REGION, DASHSCOPE_COMPAT_BASES["cn"])
-    url = f"{base}/chat/completions"
-    headers = {"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"}
+def llm_summary(payload: Dict[str, Any], timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
+    """调用火山引擎 /chat/completions，返回 {summary, keywords}，强制 JSON。"""
+    url = f"{VOLCANO_API_ENDPOINT}/chat/completions"
+    headers = {"Authorization": f"Bearer {VOLCANO_API_TOKEN}", "Content-Type": "application/json"}
 
     def body(use_resp_fmt=True):
         b = {
-            "model": QWEN_MODEL,
+            "model": LLM_MODEL,
             "messages": [
                 {"role": "system", "content": PROMPT_SUMMARY},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
             ],
             "stream": False,
+            "temperature": LLM_TEMPERATURE,
         }
         if use_resp_fmt:
             b["response_format"] = {"type": "json_object"}
             
         return b
 
-    attempt, use_resp = 0, QWEN_OPENAI_COMPAT
+    attempt, use_resp = 0, True
     while True:
         attempt += 1
         try:
@@ -206,7 +205,7 @@ def qwen_summary(payload: Dict[str, Any], timeout: int = 60, max_retries: int = 
                 time.sleep(wait); continue
 
             if resp.status_code in (401, 403):
-                raise RuntimeError(f"Qwen 鉴权/权限错误 {resp.status_code}: {resp.text[:200]}")
+                raise RuntimeError(f"火山引擎API鉴权/权限错误 {resp.status_code}: {resp.text[:200]}")
             resp.raise_for_status()
 
         except Exception as e:
@@ -222,14 +221,13 @@ _CHN_RE = re.compile(r"[\u4e00-\u9fff]")
 def _has_chinese(s: Optional[str]) -> bool:
     return bool(_CHN_RE.search(s or ""))
 
-def qwen_fix_to_zh(result: Dict[str, Any], timeout: int = 40) -> Dict[str, Any]:
+def llm_fix_to_zh(result: Dict[str, Any], timeout: int = 40) -> Dict[str, Any]:
     """当模型偶发输出英文时，将现有 JSON 的值翻译为简体中文并保持键不变。"""
-    base = DASHSCOPE_COMPAT_BASES.get(DASHSCOPE_REGION, DASHSCOPE_COMPAT_BASES["cn"])
-    url = f"{base}/chat/completions"
-    headers = {"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"}
+    url = f"{VOLCANO_API_ENDPOINT}/chat/completions"
+    headers = {"Authorization": f"Bearer {VOLCANO_API_TOKEN}", "Content-Type": "application/json"}
     content = json.dumps(result, ensure_ascii=False)
     body = {
-        "model": QWEN_MODEL,
+        "model": LLM_MODEL,
         "messages": [
             {"role": "system", "content": "请把下列 JSON 中的所有值翻译为简体中文，保持键名与结构完全一致，仅返回 JSON。"},
             {"role": "user", "content": content}
@@ -515,16 +513,16 @@ def process_row(row: Dict[str,Any]) -> Dict[str,Any]:
         "type": row.get("type"),
         "time_hint": row.get("published_at")
     }
-    s = qwen_summary(payload)
+    s = llm_summary(payload)
 
     # 强制中文：若摘要不含中文字符，则进行一次 JSON 内值的中文化兜底
     if not _has_chinese(s.get("summary")):
-        s = qwen_fix_to_zh(s)
+        s = llm_fix_to_zh(s)
     # 同时确保关键词为中文（若关键词存在且大多为英文，做一次兜底）
     if isinstance(s.get("keywords"), list):
         joined = " ".join([str(x) for x in s["keywords"]])
         if not _has_chinese(joined):
-            s = qwen_fix_to_zh(s)
+            s = llm_fix_to_zh(s)
 
     # ===== 国家与省份推断（优先 LLM，再回退启发式） =====
     country_iso3 = row.get("country_iso3")
@@ -596,6 +594,24 @@ def process_row(row: Dict[str,Any]) -> Dict[str,Any]:
     # 可视化：生成摘要预览
     _summary_preview = (s.get("summary") or "")[:SUMMARY_PREVIEW_CHARS] if isinstance(s, dict) else None
 
+    payload_value = {
+        "lang_hint": row.get("lang_hint"),
+        "geo_source": geo_source,
+        "llm_country": (s.get("country") if isinstance(s, dict) else None),
+        "llm_province": (s.get("province") if isinstance(s, dict) else None),
+        "summary_preview": _summary_preview,
+        "keywords": s.get("keywords"),
+    }
+
+    embedding = build_fact_event_embedding(
+        type_=row.get("type") or "",
+        title=row.get("title") or "",
+        summary=s.get("summary") if isinstance(s, dict) else None,
+        source=row.get("source"),
+        keywords=s.get("keywords") if isinstance(s, dict) else None,
+        payload=payload_value,
+    )
+
     rec = {
         "type": row.get("type"),
         "title": row.get("title"),
@@ -609,15 +625,10 @@ def process_row(row: Dict[str,Any]) -> Dict[str,Any]:
         "row_hash": row.get("row_hash"),
         "src_table": row.get("src_table"),
         "src_id": str(row.get("src_id")),
-        "payload": {
-            "lang_hint": row.get("lang_hint"),
-            "geo_source": geo_source,
-            "llm_country": (s.get("country") if isinstance(s, dict) else None),
-            "llm_province": (s.get("province") if isinstance(s, dict) else None),
-            "summary_preview": _summary_preview,
-            "keywords": s.get("keywords"),
-        }
+        "payload": payload_value,
     }
+    if embedding is not None:
+        rec["embedding"] = embedding
     return rec
 
 def route_and_insert(rec: Dict[str,Any]) -> str:
@@ -690,7 +701,7 @@ def run_once(offset=0, limit=BATCH_SIZE, sleep_sec=SLEEP_BETWEEN_CALLS) -> int:
 def main():
     global PROV_MAP, COUNTRY_MAP
     args = parse_args()
-    global UNIFIED_VIEW, DIM_CN_REGION, DIM_COUNTRY, BATCH_SIZE, MAX_BATCHES, SLEEP_BETWEEN_CALLS, DAYS_WINDOW, DASHSCOPE_REGION, QWEN_OPENAI_COMPAT, FACT_TABLE, GEO_BY_LLM, LOG_LLM, LOG_GEO, SUMMARY_PREVIEW_CHARS
+    global UNIFIED_VIEW, DIM_CN_REGION, DIM_COUNTRY, BATCH_SIZE, MAX_BATCHES, SLEEP_BETWEEN_CALLS, DAYS_WINDOW, FACT_TABLE, GEO_BY_LLM, LOG_LLM, LOG_GEO, SUMMARY_PREVIEW_CHARS
     UNIFIED_VIEW = args.unified_view
     DIM_CN_REGION = args.dim_cn_region
     DIM_COUNTRY = args.dim_country
@@ -698,8 +709,6 @@ def main():
     MAX_BATCHES = args.max_batches
     SLEEP_BETWEEN_CALLS = args.sleep
     DAYS_WINDOW = str(args.days or "").strip()
-    DASHSCOPE_REGION = args.region
-    QWEN_OPENAI_COMPAT = args.openai_compat
     FACT_TABLE = args.fact_table
     GEO_BY_LLM = bool(args.geo_by_llm)
     LOG_LLM = bool(args.log_llm)
@@ -717,12 +726,11 @@ def main():
     if TYPE_FILTER_EXCLUDE:
         log.info(f"排除类型: {sorted(TYPE_FILTER_EXCLUDE)}")
 
-    # 现在再打印所用模型与端点（region/compat 已更新）
-    model_src = "env/.env" if os.environ.get("QWEN_MODEL") else "DEFAULT"
-    log.info(f"LLM 使用模型: {QWEN_MODEL}（来源: {model_src}）, 兼容模式={QWEN_OPENAI_COMPAT}, 区域={DASHSCOPE_REGION}, 地理由LLM={GEO_BY_LLM}")
+    # 现在再打印所用模型与端点
+    model_src = "env/.env" if os.environ.get("LLM_MODEL") else "DEFAULT"
+    log.info(f"LLM 使用模型: {LLM_MODEL}（来源: {model_src}）, 地理由LLM={GEO_BY_LLM}")
     log.info(f"可视化: log_llm={LOG_LLM}, log_geo={LOG_GEO}, summary_chars={SUMMARY_PREVIEW_CHARS}")
-    _BASE_EP = DASHSCOPE_COMPAT_BASES.get(DASHSCOPE_REGION, DASHSCOPE_COMPAT_BASES["cn"])
-    log.info(f"LLM 端点: {_BASE_EP}/chat/completions")
+    log.info(f"LLM 端点: {VOLCANO_API_ENDPOINT}/chat/completions")
 
     # 批处理中保持稳定的时间窗起点（一次计算，多批复用）
     global STABLE_SINCE_ISO

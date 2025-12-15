@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Competitor Analysis → Qwen Summarization → Supabase Upsert (dashboard_daily_reports)
+Competitor Analysis → LLM Summarization → Supabase Upsert (dashboard_daily_reports)
 
 依赖:
     pip install supabase requests python-dotenv python-dateutil
@@ -8,11 +8,12 @@ Competitor Analysis → Qwen Summarization → Supabase Upsert (dashboard_daily_
 环境变量:
     SUPABASE_URL=...
     SUPABASE_SERVICE_KEY=...
-    QWEN_API_KEY=...
-    QWEN_MODEL=qwen3-max
-    DASHSCOPE_API_KEY=...        # 可与 QWEN_API_KEY 二选一
-    DASHSCOPE_REGION=cn          # cn | intl | finance
-    QWEN_OPENAI_COMPAT=1         # 设为1启用 OpenAI 兼容接口（qwen3-* 推荐）
+    VOLCANO_API_TOKEN=...           # 火山引擎 API Token（用于 deepseek-v3-1-terminus）
+    VOLCANO_API_ENDPOINT=...        # 火山引擎 API 端点（默认：https://ark.cn-beijing.volces.com/api/v3）
+    LLM_MODEL=deepseek-v3-1-terminus # 大模型名称
+    LLM_TEMPERATURE=0.0             # 温度参数
+    QWEN_API_KEY=...                # Qwen API Key（仅用于 Embedding）
+    EMBEDDING_MODEL=text-embedding-v4 # Embedding 模型
     VIEW=management                 # management/market/sales/product
     DAYS=365                        # 扫描最近 N 天
     BATCH_SIZE=100                  # 每批条数
@@ -38,46 +39,45 @@ from typing import Dict, Any, List, Tuple, Set, Optional
 
 import requests
 from supabase import create_client, Client
-from dotenv import load_dotenv
+from config_loader import config
 from dateutil import parser as dateparser
 
-# ---------------- 环境变量 ----------------
-load_dotenv()
+# ---------------- 配置加载 ----------------
+# 从 config.yaml 和 .env 加载配置
+SUPABASE_URL  = config.supabase_url
+SUPABASE_KEY  = config.supabase_key
+# 火山引擎 API 配置（用于大模型调用）
+VOLCANO_API_TOKEN = config.volcano_api_token
+VOLCANO_API_ENDPOINT = config.llm_endpoint
+LLM_MODEL = config.llm_model
+LLM_TEMPERATURE = config.llm_temperature
+# Qwen API 配置（仅用于 Embedding）
+QWEN_API_KEY  = config.qwen_api_key
+ENABLE_NOISE_FILTER = config.enable_noise_filter
 
-SUPABASE_URL  = os.getenv("SUPABASE_URL")
-SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY")
-QWEN_API_KEY  = os.getenv("QWEN_API_KEY")
-QWEN_MODEL    = os.getenv("QWEN_MODEL", "qwen3-max")
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
-API_KEY = DASHSCOPE_API_KEY or QWEN_API_KEY  # 兼容两种命名
-DASHSCOPE_REGION = os.getenv("DASHSCOPE_REGION", "cn").lower()  # cn | intl | finance
-QWEN_OPENAI_COMPAT = os.getenv("QWEN_OPENAI_COMPAT", "1").lower() in ("1","true","yes")
-QWEN_TEMPERATURE = float(os.getenv("QWEN_TEMPERATURE", "0.0"))
-ENABLE_NOISE_FILTER = os.getenv("ENABLE_NOISE_FILTER", "0").lower() in ("1", "true", "yes")
+# 业务配置（从 config.yaml 读取）
+VIEW          = config.view
+DAYS          = config.days
+BATCH_SIZE    = config.batch_size
+MAX_BATCHES   = config.max_batches
+SLEEP_SEC     = config.sleep_sec
+FORCE_REFRESH = config.force_refresh
+DEBUG         = config.debug
 
-VIEW          = os.getenv("VIEW", "management")
-DAYS          = int(os.getenv("DAYS", "30"))
-_ENV_BATCH    = os.getenv("BATCH_SIZE")
-BATCH_SIZE    = int(_ENV_BATCH or "40")
-MAX_BATCHES   = int(os.getenv("MAX_BATCHES", "10"))
-SLEEP_SEC     = float(os.getenv("SLEEP_SEC", "0.8"))
-FORCE_REFRESH = os.getenv("FORCE_REFRESH", "0") == "1"
-DEBUG         = os.getenv("DEBUG", "0") == "1"
-
-ANALYSIS_TABLE = os.getenv("ANALYSIS_TABLE", "fact_events")
+ANALYSIS_TABLE = config.analysis_table
 SOURCE_TABLE = (ANALYSIS_TABLE or "").lower()
 IS_FACT_EVENTS = SOURCE_TABLE == "fact_events"
-COMP_TABLE     = "00_competitors"
-DDR_TABLE      = "dashboard_daily_reports"
-FACT_DDR_TABLE = os.getenv("FACT_DDR_TABLE", "dashboard_daily_events")
-MONTHLY_TABLE  = os.getenv("MONTHLY_TABLE", FACT_DDR_TABLE)
-MONTHLY_DAYS   = int(os.getenv("MONTHLY_DAYS", "30"))
-MONTHLY_SOURCE_TABLE = os.getenv("MONTHLY_SOURCE_TABLE", SOURCE_TABLE)
-MONTHLY_LIMIT  = int(os.getenv("MONTHLY_LIMIT", "10"))
-MONTHLY_SUMMARY_MAX_LENGTH = int(os.getenv("MONTHLY_SUMMARY_MAX_LENGTH", "1000"))  # 月度汇总文本最大长度，默认1000字
+COMP_TABLE     = config.competitors_table
+DDR_TABLE      = config.daily_reports_table
+FACT_DDR_TABLE = config.fact_ddr_table
+MONTHLY_TABLE  = config.monthly_table
+MONTHLY_DAYS   = config.monthly_days
+MONTHLY_SOURCE_TABLE = config.monthly_source_table
+MONTHLY_LIMIT  = config.monthly_limit
+MONTHLY_SUMMARY_MAX_LENGTH = config.monthly_summary_max_length
 
-if not all([SUPABASE_URL, SUPABASE_KEY, API_KEY]):
-    raise SystemExit("请设置 SUPABASE_URL / SUPABASE_SERVICE_KEY / QWEN_API_KEY 或 DASHSCOPE_API_KEY")
+if not all([SUPABASE_URL, SUPABASE_KEY, VOLCANO_API_TOKEN]):
+    raise SystemExit("请设置 SUPABASE_URL / SUPABASE_SERVICE_KEY / VOLCANO_API_TOKEN（在 .env 文件中）")
 
 # ---------------- 常量 ----------------
 # 统一使用业务指定的四类（不要额外判别）
@@ -113,7 +113,7 @@ NOISE_SOURCE_KEYWORDS = {
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
-logger = logging.getLogger("qwen-daily-report")
+logger = logging.getLogger("llm-daily-report")
 if _ENV_BATCH:
     logger.warning(f"环境变量 BATCH_SIZE={_ENV_BATCH} 已覆盖默认值 40，可调整或取消该变量以应用新的节流策略。")
 if ENABLE_NOISE_FILTER:
@@ -279,34 +279,23 @@ MONTHLY_PROMPT_TPL = """
 {event_lines}
 """.strip()
 
-# ---------------- Qwen API ----------------
-DASHSCOPE_BASES = [
-    "https://dashscope.aliyuncs.com",
-    "https://dashscope-intl.aliyuncs.com",
-]
-
-DASHSCOPE_COMPAT_BASES = {
-    "cn": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "intl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-    "finance": "https://dashscope-finance.aliyuncs.com/compatible-mode/v1",
-}
-def qwen_chat_json_compat(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
-    """通过 OpenAI 兼容接口 (/chat/completions) 调用 Qwen（适配 qwen3-* 等）。
+# ---------------- 火山引擎 API ----------------
+def volcano_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
+    """通过 OpenAI 兼容接口 (/chat/completions) 调用火山引擎 deepseek-v3-1-terminus。
     默认强制 JSON（response_format），若不支持则自动降级。
     """
-    base = DASHSCOPE_COMPAT_BASES.get(DASHSCOPE_REGION, DASHSCOPE_COMPAT_BASES["cn"])  # 依据地域
-    url = f"{base}/chat/completions"
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    url = f"{VOLCANO_API_ENDPOINT}/chat/completions"
+    headers = {"Authorization": f"Bearer {VOLCANO_API_TOKEN}", "Content-Type": "application/json"}
 
     def make_payload(use_resp_fmt: bool = True) -> Dict[str, Any]:
         body: Dict[str, Any] = {
-            "model": QWEN_MODEL,
+            "model": LLM_MODEL,
             "messages": [
                 {"role": "system", "content": "你是严谨的情报分析师，严格输出 JSON 对象。"},
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
-            "temperature": QWEN_TEMPERATURE,
+            "temperature": LLM_TEMPERATURE,
         }
         if use_resp_fmt:
             body["response_format"] = {"type": "json_object"}
@@ -345,7 +334,7 @@ def qwen_chat_json_compat(prompt: str, timeout: int = 60, max_retries: int = 6) 
 
             # 鉴权/权限
             if resp.status_code in (401, 403):
-                raise RuntimeError(f"DashScope兼容接口鉴权/权限错误 {resp.status_code}: {resp.text[:180]}")
+                raise RuntimeError(f"火山引擎API鉴权/权限错误 {resp.status_code}: {resp.text[:180]}")
 
             resp.raise_for_status()
         except Exception as e:
@@ -480,77 +469,10 @@ def _parse_qwen_json(text: str) -> Dict[str, Any]:
         "category": "",
     }
 
-def qwen_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
-    if QWEN_OPENAI_COMPAT or QWEN_MODEL.lower().startswith("qwen3-"):
-        logger.info("使用 OpenAI 兼容接口：/chat/completions")
-        return qwen_chat_json_compat(prompt, timeout=timeout, max_retries=max_retries)
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-
-    def payload_messages():
-        return {
-            "model": QWEN_MODEL,
-            "input": {"messages": [
-                {"role": "system", "content": "你是严谨的情报分析师，严格输出 JSON 对象。"},
-                {"role": "user", "content": prompt}
-            ]},
-            "parameters": {"result_format": "json", "temperature": QWEN_TEMPERATURE, "top_p": 0.8}
-        }
-
-    def payload_plain():
-        return {
-            "model": QWEN_MODEL,
-            "input": prompt,
-            "parameters": {"temperature": QWEN_TEMPERATURE, "top_p": 0.8}
-        }
-
-    attempt, use_plain_input = 0, False
-    bases_to_try = DASHSCOPE_BASES[:]
-
-    while True:
-        attempt += 1
-        base = bases_to_try[0]
-        url = f"{base}/api/v1/services/aigc/text-generation/generation"
-        payload = payload_plain() if use_plain_input else payload_messages()
-
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            if resp.status_code == 200:
-                data = resp.json()
-                out = data.get("output") or {}
-                text = out.get("text") or data.get("output_text")
-                if not text and "choices" in out:
-                    text = out["choices"][0]["message"]["content"]
-                if not text:
-                    raise ValueError("Qwen 返回空")
-                if DEBUG:
-                    logger.info(f"[DEBUG] raw_out: {str(text)[:200]}")
-                return _parse_qwen_json(text)
-
-            if resp.status_code == 400 and ("url error" in resp.text or "InvalidParameter" in resp.text):
-                if len(bases_to_try) > 1:
-                    bases_to_try.pop(0)
-                    logger.warning("切换域名重试...")
-                    continue
-                if not use_plain_input:
-                    use_plain_input = True
-                    logger.warning("降级为 input=纯文本")
-                    continue
-
-            if resp.status_code in (429, 500, 502, 503, 504):
-                wait = min(2 ** (attempt - 1), 20) * (1 + random.random())
-                logger.warning(f"限流/服务端错误 {resp.status_code}，睡 {wait:.1f}s")
-                time.sleep(wait)
-                continue
-
-            resp.raise_for_status()
-
-        except Exception as e:
-            if attempt < max_retries:
-                wait = min(2 ** (attempt - 1), 10)
-                logger.warning(f"网络/解析异常，第{attempt}次重试，睡 {wait:.1f}s | {e}")
-                time.sleep(wait)
-                continue
-            raise
+def llm_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
+    """调用大模型API（火山引擎），返回JSON格式结果"""
+    logger.info("使用火山引擎 OpenAI 兼容接口：/chat/completions")
+    return volcano_chat_json(prompt, timeout=timeout, max_retries=max_retries)
 
 # ---------------- Supabase IO ----------------
 def fetch_analysis_batch(offset: int, limit: int, days: int = DAYS) -> List[Dict[str, Any]]:
@@ -963,7 +885,7 @@ def run_pipeline(max_batches: int = int(os.getenv("MAX_BATCHES", "10")),
                  sleep_sec: float = float(os.getenv("SLEEP_SEC", "0.3"))):
     target_table = FACT_DDR_TABLE if IS_FACT_EVENTS else DDR_TABLE
     logger.info(
-        f"Qwen 模型: {QWEN_MODEL} | 视角: {VIEW} | 源表: {ANALYSIS_TABLE} | 目标表: {target_table} | "
+        f"大模型: {LLM_MODEL} | 视角: {VIEW} | 源表: {ANALYSIS_TABLE} | 目标表: {target_table} | "
         f"批大小: {batch_size} | 批次数: {max_batches} | DAYS={DAYS} | FORCE_REFRESH={int(FORCE_REFRESH)}"
     )
 
@@ -1018,10 +940,10 @@ def run_pipeline(max_batches: int = int(os.getenv("MAX_BATCHES", "10")),
 
                     try:
                         prompt, _ = build_fact_event_prompt(ar)
-                        llm_out = qwen_chat_json(prompt)
+                        llm_out = llm_chat_json(prompt)
                         payload, pr, created_iso = make_event_payload_from_llm(llm_out, ar)
                     except Exception as e:
-                        logger.warning(f"[WARN] Qwen 失败，最小payload回退 fact_event_id={event_id} | {e}")
+                        logger.warning(f"[WARN] 大模型调用失败，最小payload回退 fact_event_id={event_id} | {e}")
                         payload, pr, created_iso = make_event_payload_minimal(ar)
 
                     upsert_fact_ddr_row(
@@ -1032,7 +954,7 @@ def run_pipeline(max_batches: int = int(os.getenv("MAX_BATCHES", "10")),
                         event_type=ev_type,
                         priority=pr,
                         created_ts_iso=created_iso,
-                        model=QWEN_MODEL,
+                        model=LLM_MODEL,
                     )
 
                     cache_exist_map[key][event_id] = event_id
@@ -1063,7 +985,7 @@ def run_pipeline(max_batches: int = int(os.getenv("MAX_BATCHES", "10")),
                     llm_out = qwen_chat_json(prompt)
                     payload, pr, created_iso = make_payload_from_llm(llm_out, ar, comp, VIEW)
                 except Exception as e:
-                    logger.warning(f"[WARN] Qwen 失败，最小payload回退 analysis_id={ar.get('id')} | {e}")
+                    logger.warning(f"[WARN] 大模型调用失败，最小payload回退 analysis_id={ar.get('id')} | {e}")
                     payload, pr, created_iso = make_payload_minimal(ar, comp, VIEW)
 
                 upsert_ddr_row(
@@ -1172,7 +1094,7 @@ def upsert_weekly_row(category_name: str, payload: Dict[str, Any]) -> None:
         "category": category_name,
         "payload": payload,
         "created_ts": datetime.now(timezone.utc).isoformat(),
-        "model_name": QWEN_MODEL,
+        "model_name": LLM_MODEL,
         "prompt_version": "weekly_v1",
         "processed_at": datetime.now(timezone.utc).isoformat()
     }
@@ -1630,7 +1552,7 @@ def upsert_monthly_row(category_name: str, payload: Dict[str, Any], days: int, s
             "priority": priority,
             "category": category_name,
             "created_ts": now_iso,
-            "model_name": QWEN_MODEL,
+            "model_name": LLM_MODEL,
             "prompt_version": "monthly_v1",
             "processed_at": now_iso,
             "content_hash": content_hash,
@@ -1647,7 +1569,7 @@ def upsert_monthly_row(category_name: str, payload: Dict[str, Any], days: int, s
             "period_end": end_dt.date().isoformat(),
             "category": category_name,
             "payload": clean_payload,
-            "model_name": QWEN_MODEL,
+            "model_name": LLM_MODEL,
             "prompt_version": "monthly_v1",
             "processed_at": now_iso,
         }
@@ -1682,7 +1604,22 @@ def run_monthly_summary():
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
-    MODE = os.getenv("MODE", "monthly").lower()  # monthly | daily | weekly
+    import argparse
+    parser = argparse.ArgumentParser(description="每日报告处理：事件摘要 → 仪表板展示表")
+    parser.add_argument("--mode", choices=["daily", "weekly", "monthly"], default=None, 
+                        help="运行模式（daily=逐事件写入, weekly=15天四类汇总, monthly=月度汇总）")
+    parser.add_argument("--days", type=int, default=None, help="处理天数范围（目前仅用于日志记录）")
+    parser.add_argument("--batch-size", type=int, default=None, help="每批处理条数（目前仅用于日志记录）")
+    parser.add_argument("--max-batches", type=int, default=None, help="最多处理批次数（目前仅用于日志记录）")
+    args = parser.parse_args()
+    
+    # 使用命令行参数覆盖配置
+    MODE = (args.mode or config.mode).lower()
+    
+    # 记录参数（方便调试）
+    if args.days or args.batch_size or args.max_batches:
+        logger.info(f"CLI参数: days={args.days}, batch_size={args.batch_size}, max_batches={args.max_batches}")
+    
     if MODE == "weekly":
         # 按近15天四类生成 4 份汇总
         run_weekly_summary(os.getenv("ANALYSIS_TABLE", ANALYSIS_TABLE))

@@ -8,11 +8,12 @@ News Cleaning + Qwen Summarization + Supabase Upsert (完整修正版)
 环境变量:
     SUPABASE_URL=...
     SUPABASE_SERVICE_KEY=...
-    QWEN_API_KEY=...
-    QWEN_MODEL=qwen-max   # 或使用 qwen-max-latest
-    DASHSCOPE_API_KEY=...        # 可与 QWEN_API_KEY 二选一
-    DASHSCOPE_REGION=cn          # cn | intl | finance
-    QWEN_OPENAI_COMPAT=0         # 设为1启用 OpenAI 兼容接口
+    VOLCANO_API_TOKEN=...           # 火山引擎 API Token（用于 deepseek-v3-1-terminus）
+    VOLCANO_API_ENDPOINT=...        # 火山引擎 API 端点（默认：https://ark.cn-beijing.volces.com/api/v3）
+    LLM_MODEL=deepseek-v3-1-terminus # 大模型名称
+    LLM_TEMPERATURE=0.0             # 温度参数
+    QWEN_API_KEY=...                # Qwen API Key（仅用于 Embedding）
+    EMBEDDING_MODEL=text-embedding-v4 # Embedding 模型
 """
 
 import os
@@ -27,33 +28,32 @@ from typing import Dict, Any, List, Optional
 import requests
 SESSION = requests.Session()
 from supabase import create_client, Client
-from dotenv import load_dotenv
+from config_loader import config
 
-# ---------------- 环境变量 ----------------
-load_dotenv()
+# ---------------- 配置加载 ----------------
+# 从 .env 加载敏感信息
+SUPABASE_URL = config.supabase_url
+SUPABASE_KEY = config.supabase_key
+# 火山引擎 API 配置（用于大模型调用）
+VOLCANO_API_TOKEN = config.volcano_api_token
+VOLCANO_API_ENDPOINT = config.llm_endpoint
+LLM_MODEL = config.llm_model
+LLM_TEMPERATURE = config.llm_temperature
+# Qwen API 配置（仅用于 Embedding）
+QWEN_API_KEY = config.qwen_api_key
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-QWEN_API_KEY = os.getenv("QWEN_API_KEY")
-QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-max")
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
-API_KEY = DASHSCOPE_API_KEY or QWEN_API_KEY  # 兼容两种命名
-DASHSCOPE_REGION = os.getenv("DASHSCOPE_REGION", "cn").lower()  # cn | intl | finance
-QWEN_OPENAI_COMPAT = os.getenv("QWEN_OPENAI_COMPAT", "").lower() in ("1","true","yes")
+# 业务配置（从 config.yaml 读取）
+PIPELINE_MODE = os.getenv("PIPELINE_MODE", "multi").lower()  # multi | single（保留环境变量支持）
+RAW_NEWS_TABLE = config.raw_news_table
+BATCH_SIZE = config.batch_size
+BATCHES_DEFAULT = config.max_batches
 
-PIPELINE_MODE = os.getenv("PIPELINE_MODE", "multi").lower()  # multi | single
-RAW_NEWS_TABLE = os.getenv("RAW_NEWS_TABLE", "00_news")      # 原始新闻表
-
-
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))  # 每批文章数量
-BATCHES_DEFAULT = int(os.getenv("BATCHES", "20"))  # 默认批次数（可用环境变量 BATCHES 覆盖）
-
-if not all([SUPABASE_URL, SUPABASE_KEY, QWEN_API_KEY]):
-    raise SystemExit("请设置 SUPABASE_URL / SUPABASE_SERVICE_KEY / QWEN_API_KEY")
+if not all([SUPABASE_URL, SUPABASE_KEY, VOLCANO_API_TOKEN]):
+    raise SystemExit("请设置 SUPABASE_URL / SUPABASE_SERVICE_KEY / VOLCANO_API_TOKEN（在 .env 文件中）")
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
-logger = logging.getLogger("qwen-news-pipeline")
+logger = logging.getLogger("llm-news-pipeline")
 
 logger.info(f"Using RAW_NEWS_TABLE = {RAW_NEWS_TABLE} | PIPELINE_MODE = {PIPELINE_MODE}")
 
@@ -127,7 +127,7 @@ def fetch_summaries_map(ids: List[str]) -> Dict[str, Dict[str, Any]]:
     if not ids:
         return {}
     # Supabase: where in (...)
-    res = sb.table("news_summaries") \
+    res = sb.table(config.news_summaries_table) \
         .select("news_id,short_summary,long_summary,ai_suggestion,ai_suggestion_full") \
         .in_("news_id", ids) \
         .execute()
@@ -136,17 +136,7 @@ def fetch_summaries_map(ids: List[str]) -> Dict[str, Dict[str, Any]]:
         m[str(r["news_id"])] = r
     return m
 
-# ---------------- Qwen API ----------------
-DASHSCOPE_BASES = [
-    "https://dashscope.aliyuncs.com",        # 国内
-    "https://dashscope-intl.aliyuncs.com",   # 国际
-]
-
-DASHSCOPE_COMPAT_BASES = {
-    "cn": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "intl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-    "finance": "https://dashscope-finance.aliyuncs.com/compatible-mode/v1",
-}
+# ---------------- 火山引擎 API ----------------
 
 def safe_truncate(s: str, max_len: int) -> str:
     return s[:max_len] if len(s) > max_len else s
@@ -164,17 +154,16 @@ def _strip_fence_to_json(s: str) -> dict:
     return json.loads(s)
 
 
-def qwen_chat_json_compat(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
-    """通过 OpenAI 兼容接口 (/chat/completions) 调用（用于 qwen3-* / 需要兼容路径时）。
+def volcano_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
+    """通过 OpenAI 兼容接口 (/chat/completions) 调用火山引擎 deepseek-v3-1-terminus。
     要求模型严格输出 JSON；若服务端不支持 response_format，会自动降级为纯提示词约束。
     """
-    base = DASHSCOPE_COMPAT_BASES.get(DASHSCOPE_REGION, DASHSCOPE_COMPAT_BASES["cn"])  # 依据地域选择
-    url = f"{base}/chat/completions"
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    url = f"{VOLCANO_API_ENDPOINT}/chat/completions"
+    headers = {"Authorization": f"Bearer {VOLCANO_API_TOKEN}", "Content-Type": "application/json"}
 
     def make_payload(use_resp_fmt: bool = True):
         body: Dict[str, Any] = {
-            "model": QWEN_MODEL,
+            "model": LLM_MODEL,
             "messages": [
                 {"role": "system", "content": "你是严谨的新闻编辑，严格输出 JSON。"},
                 {"role": "user", "content": prompt},
@@ -218,7 +207,7 @@ def qwen_chat_json_compat(prompt: str, timeout: int = 60, max_retries: int = 6) 
 
             # 鉴权与权限（常见：401=Key或地域不匹配；403=无该模型权限）
             if resp.status_code in (401, 403):
-                raise RuntimeError(f"DashScope兼容接口鉴权/权限错误 {resp.status_code}: {resp.text[:180]}")
+                raise RuntimeError(f"火山引擎API鉴权/权限错误 {resp.status_code}: {resp.text[:180]}")
 
             resp.raise_for_status()
         except Exception as e:
@@ -229,78 +218,11 @@ def qwen_chat_json_compat(prompt: str, timeout: int = 60, max_retries: int = 6) 
                 continue
             raise
 
-def qwen_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
-    if QWEN_OPENAI_COMPAT or QWEN_MODEL.lower().startswith("qwen3-"):
-        logger.info("使用 OpenAI 兼容接口调用：/chat/completions")
-        return qwen_chat_json_compat(prompt, timeout=timeout, max_retries=max_retries)
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+def llm_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
+    """调用大模型API（火山引擎），返回JSON格式结果"""
+    logger.info("使用火山引擎 OpenAI 兼容接口：/chat/completions")
+    return volcano_chat_json(prompt, timeout=timeout, max_retries=max_retries)
 
-    def make_payload_messages():
-        return {
-            "model": QWEN_MODEL,
-            "input": {
-                "messages": [
-                    {"role": "system", "content": "你是严谨的新闻编辑，严格输出 JSON。"},
-                    {"role": "user", "content": prompt}
-                ]
-            },
-            "parameters": {"result_format": "json", "temperature": 0.0, "top_p": 0.8}
-        }
-
-    def make_payload_plain():
-            sys = "你是严谨的新闻编辑，严格输出 JSON。"
-            return {
-                "model": QWEN_MODEL,
-                "input": f"{sys}\n\n{prompt}",
-                "parameters": {"result_format": "json", "temperature": 0.0, "top_p": 0.8}
-            }
-
-    attempt, use_plain_input = 0, False
-    bases_to_try = DASHSCOPE_BASES[:]
-
-    while True:
-        attempt += 1
-        base = bases_to_try[0]
-        url = f"{base}/api/v1/services/aigc/text-generation/generation"
-        payload = make_payload_plain() if use_plain_input else make_payload_messages()
-
-        try:
-            resp = SESSION.post(url, headers=headers, json=payload, timeout=timeout)
-            if resp.status_code == 200:
-                data = resp.json()
-                out = data.get("output") or {}
-                text = out.get("text") or data.get("output_text")
-                if not text and "choices" in out:
-                    text = out["choices"][0]["message"]["content"]
-                if not text:
-                    raise ValueError("Qwen 返回空")
-                return _strip_fence_to_json(text)
-
-            if resp.status_code == 400 and ("url error" in resp.text or "InvalidParameter" in resp.text):
-                if len(bases_to_try) > 1:
-                    bases_to_try.pop(0)
-                    logger.warning("切换域名重试...")
-                    continue
-                if not use_plain_input:
-                    use_plain_input = True
-                    logger.warning("降级为 input=纯文本")
-                    continue
-
-            if resp.status_code in (429, 500, 502, 503, 504):
-                wait = min(2 ** (attempt - 1), 20) * (1 + random.random())
-                logger.warning(f"限流/服务端错误 {resp.status_code}，睡 {wait:.1f}s")
-                time.sleep(wait)
-                continue
-
-            resp.raise_for_status()
-
-        except Exception as e:
-            if attempt < max_retries:
-                wait = min(2 ** (attempt - 1), 10)
-                logger.warning(f"网络异常，第{attempt}次重试，睡 {wait:.1f}s | {e}")
-                time.sleep(wait)
-                continue
-            raise
 
 # ---------------- Key Normalizer ----------------
 def _normalize_summary_keys(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -486,13 +408,13 @@ ADVISOR_PROMPT = """
 
 def call_summarizer(clean_text_: str, title_hint: str = "") -> Dict[str, Any]:
     prompt = SUMMARY_PROMPT.format(clean_text=clean_text_)
-    res = qwen_chat_json(prompt)
+    res = llm_chat_json(prompt)
     return _normalize_summary_keys(res)
 
 def call_entities(clean_text_: str) -> Dict[str, Any]:
     prompt = ENTITIES_PROMPT.format(clean_text=clean_text_)
     try:
-        res = qwen_chat_json(prompt)
+        res = llm_chat_json(prompt)
     except Exception:
         return {"org": [], "person": [], "location": [], "date": []}
     if not isinstance(res, dict):
@@ -518,7 +440,7 @@ def call_advisor(short_summary: str, long_summary: str, bullets: List[str], enti
         bullets_json=json.dumps(bullets or [], ensure_ascii=False),
         entities_json=json.dumps(entities or {}, ensure_ascii=False),
     )
-    res = qwen_chat_json(prompt)
+    res = llm_chat_json(prompt)
     norm = _normalize_summary_keys(res)
     # 兜底：若短建议为空而长建议有内容，用前80字填充短建议
     if not norm.get("ai_suggestion") and norm.get("ai_suggestion_full"):
@@ -530,7 +452,7 @@ def summarize_with_qwen(clean_text_: str, title_hint: str = "") -> Dict[str, Any
     """single 模式：一次性产生全部字段（保留回滚能力）"""
     body = safe_truncate(clean_text_, 6000)
     prompt = PROMPT_TPL.format(title_hint=title_hint or "无", body=body)
-    raw = qwen_chat_json(prompt)
+    raw = llm_chat_json(prompt)
     norm = _normalize_summary_keys(raw)
     return _postprocess_summary(norm)
 
@@ -549,11 +471,11 @@ def upsert_summary(row: Dict[str, Any], clean_txt: str, summary: Dict[str, Any])
         "ai_suggestion": ai_suggestion[:200],
         "ai_suggestion_full": ai_suggestion_full[:2000],
         "summary_json": summary,
-        "model": QWEN_MODEL,
+        "model": LLM_MODEL,
         "status": "ok",
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
-    sb.table("news_summaries").upsert(payload, on_conflict="news_id").execute()
+    sb.table(config.news_summaries_table).upsert(payload, on_conflict="news_id").execute()
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -692,16 +614,19 @@ def run_pipeline(
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["single","multi"], default=PIPELINE_MODE)
-    parser.add_argument("--batches", type=int, default=BATCHES_DEFAULT)
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--sleep", type=float, default=0.5)
+    parser = argparse.ArgumentParser(description="新闻处理管线：摘要、建议、embedding")
+    parser.add_argument("--mode", choices=["single","multi"], default=PIPELINE_MODE, help="单条/多条处理模式")
+    parser.add_argument("--max-batches", "--batches", type=int, default=BATCHES_DEFAULT, dest="batches", help="最多处理批次数")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="每批处理条数")
+    parser.add_argument("--days", type=int, default=0, help="仅处理最近N天的新闻（0=不限）")
+    parser.add_argument("--sleep", type=float, default=0.5, help="两次API调用间的暂停秒数")
     parser.add_argument("--process-all", dest="only_missing", action="store_false", help="不论是否已有摘要/建议，全部重算")
     parser.set_defaults(only_missing=True)
     parser.add_argument("--latest", type=int, default=0, help="仅处理最新 N 条新闻（0 表示不限）")
     args = parser.parse_args()
-    logger.info(f"Qwen 模型: {QWEN_MODEL} | 批大小: {args.batch_size} | 模式: {args.mode} | 表: {RAW_NEWS_TABLE}")
+    logger.info(f"大模型: {LLM_MODEL} | 批大小: {args.batch_size} | 模式: {args.mode} | 表: {RAW_NEWS_TABLE}")
+    if args.days > 0:
+        logger.info(f"仅处理最近 {args.days} 天的新闻")
     # 覆盖一次运行模式
     PIPELINE_MODE = args.mode
     latest_limit = args.latest if args.latest > 0 else None

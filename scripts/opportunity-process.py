@@ -9,11 +9,12 @@ Opportunity Summarization → Qwen Judgement → Supabase Upsert (opportunity_in
 环境变量:
     SUPABASE_URL=...
     SUPABASE_SERVICE_KEY=...
-    QWEN_API_KEY=...
-    QWEN_MODEL=qwen3-max
-    DASHSCOPE_API_KEY=...        # 可与 QWEN_API_KEY 二选一
-    DASHSCOPE_REGION=cn          # cn | intl | finance
-    QWEN_OPENAI_COMPAT=1         # 设为1启用 OpenAI 兼容接口（qwen3-* 推荐）
+    VOLCANO_API_TOKEN=...           # 火山引擎 API Token（用于 deepseek-v3-1-terminus）
+    VOLCANO_API_ENDPOINT=...        # 火山引擎 API 端点（默认：https://ark.cn-beijing.volces.com/api/v3）
+    LLM_MODEL=deepseek-v3-1-terminus # 大模型名称
+    LLM_TEMPERATURE=0.0             # 温度参数
+    QWEN_API_KEY=...                # Qwen API Key（仅用于 Embedding）
+    EMBEDDING_MODEL=text-embedding-v4 # Embedding 模型
     BATCH_SIZE=50
     MAX_BATCHES=10
     SLEEP_SEC=0.3
@@ -33,31 +34,32 @@ from typing import Dict, Any, List, Optional
 import requests
 SESSION = requests.Session()
 from supabase import create_client, Client
-from dotenv import load_dotenv
+from config_loader import config
 
-# ---------------- 环境变量 ----------------
-load_dotenv()
+# ---------------- 配置加载 ----------------
+# 从 .env 加载敏感信息
+SUPABASE_URL  = config.supabase_url
+SUPABASE_KEY  = config.supabase_key
+# 火山引擎 API 配置（用于大模型调用）
+VOLCANO_API_TOKEN = config.volcano_api_token
+VOLCANO_API_ENDPOINT = config.llm_endpoint
+LLM_MODEL = config.llm_model
+LLM_TEMPERATURE = config.llm_temperature
+# Qwen API 配置（仅用于 Embedding）
+QWEN_API_KEY  = config.qwen_api_key
 
-SUPABASE_URL  = os.getenv("SUPABASE_URL")
-SUPABASE_KEY  = os.getenv("SUPABASE_SERVICE_KEY")
-QWEN_API_KEY  = os.getenv("QWEN_API_KEY")
-QWEN_MODEL    = os.getenv("QWEN_MODEL", "qwen3-max")
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
-API_KEY = DASHSCOPE_API_KEY or QWEN_API_KEY  # 兼容两种命名
-DASHSCOPE_REGION = os.getenv("DASHSCOPE_REGION", "cn").lower()  # cn | intl | finance
-QWEN_OPENAI_COMPAT = os.getenv("QWEN_OPENAI_COMPAT", "1").lower() in ("1","true","yes")
+# 业务配置（从 config.yaml 读取）
+BATCH_SIZE = config.batch_size
+MAX_BATCHES = config.max_batches
+SLEEP_SEC = config.sleep_sec
+ONLY_MISSING = os.getenv("ONLY_MISSING", "1").lower() in ("1","true","yes")  # 保留环境变量支持
+DAYS = config.days
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
-MAX_BATCHES = int(os.getenv("MAX_BATCHES", "10"))
-SLEEP_SEC = float(os.getenv("SLEEP_SEC", "0.3"))
-ONLY_MISSING = os.getenv("ONLY_MISSING", "1").lower() in ("1","true","yes")
-DAYS = int(os.getenv("DAYS", "30"))
+RAW_TABLE = config.raw_opportunity_table
+TARGET_TABLE = config.opportunity_insights_table
 
-RAW_TABLE = os.getenv("OPPORTUNITY_TABLE", '00_opportunity')
-TARGET_TABLE = os.getenv("OPPORTUNITY_INSIGHTS_TABLE", "opportunity_insights")
-
-if not all([SUPABASE_URL, SUPABASE_KEY, QWEN_API_KEY]):
-    raise SystemExit("请设置 SUPABASE_URL / SUPABASE_SERVICE_KEY / QWEN_API_KEY")
+if not all([SUPABASE_URL, SUPABASE_KEY, VOLCANO_API_TOKEN]):
+    raise SystemExit("请设置 SUPABASE_URL / SUPABASE_SERVICE_KEY / VOLCANO_API_TOKEN（在 .env 文件中）")
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
@@ -94,17 +96,7 @@ def clean_text(raw: str) -> str:
     txt = re.sub(r'(?m)^(0?\d{1,2})[．\.\s　]+', r'\1. ', txt)
     return txt
 
-# ---------------- Qwen API ----------------
-DASHSCOPE_BASES = [
-    "https://dashscope.aliyuncs.com",        # 国内
-    "https://dashscope-intl.aliyuncs.com",   # 国际
-]
-
-DASHSCOPE_COMPAT_BASES = {
-    "cn": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "intl": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-    "finance": "https://dashscope-finance.aliyuncs.com/compatible-mode/v1",
-}
+# ---------------- 火山引擎 API ----------------
 
 FENCE_RE = re.compile(r'^\s*```(?:json)?\s*([\s\S]*?)\s*```\s*$', re.I)
 
@@ -118,13 +110,12 @@ def _strip_fence_to_json(s: str) -> dict:
         s = s[i:j+1]
     return json.loads(s)
 
-def qwen_chat_json_compat(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
-    base = DASHSCOPE_COMPAT_BASES.get(DASHSCOPE_REGION, DASHSCOPE_COMPAT_BASES["cn"])
-    url = f"{base}/chat/completions"
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+def volcano_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
+    url = f"{VOLCANO_API_ENDPOINT}/chat/completions"
+    headers = {"Authorization": f"Bearer {VOLCANO_API_TOKEN}", "Content-Type": "application/json"}
     def make_payload(use_resp_fmt: bool = True):
         body: Dict[str, Any] = {
-            "model": QWEN_MODEL,
+            "model": LLM_MODEL,
             "messages": [
                 {"role": "system", "content": "你是严谨的行业分析师，严格输出 JSON。"},
                 {"role": "user", "content": prompt},
@@ -159,7 +150,7 @@ def qwen_chat_json_compat(prompt: str, timeout: int = 60, max_retries: int = 6) 
                 time.sleep(wait)
                 continue
             if resp.status_code in (401, 403):
-                raise RuntimeError(f"DashScope兼容接口鉴权/权限错误 {resp.status_code}: {resp.text[:180]}")
+                raise RuntimeError(f"火山引擎API鉴权/权限错误 {resp.status_code}: {resp.text[:180]}")
             resp.raise_for_status()
         except Exception as e:
             if attempt < max_retries:
@@ -169,30 +160,10 @@ def qwen_chat_json_compat(prompt: str, timeout: int = 60, max_retries: int = 6) 
                 continue
             raise
 
-def qwen_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
-    if QWEN_OPENAI_COMPAT or QWEN_MODEL.lower().startswith("qwen3-"):
-        logger.info("使用 OpenAI 兼容接口调用：/chat/completions")
-        return qwen_chat_json_compat(prompt, timeout=timeout, max_retries=max_retries)
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    def make_payload_messages():
-        return {
-            "model": QWEN_MODEL,
-            "input": {
-                "messages": [
-                    {"role": "system", "content": "你是严谨的行业分析师，严格输出 JSON。"},
-                    {"role": "user", "content": prompt}
-                ]
-            },
-            "parameters": {"result_format": "json", "temperature": 0.0, "top_p": 0.8}
-        }
-    def make_payload_plain():
-        sys = "你是严谨的行业分析师，严格输出 JSON。"
-        return {
-            "model": QWEN_MODEL,
-            "input": f"{sys}\n\n{prompt}",
-            "parameters": {"result_format": "json", "temperature": 0.0, "top_p": 0.8}
-        }
-    attempt, use_plain_input = 0, False
+def llm_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
+    """调用大模型API（火山引擎），返回JSON格式结果"""
+    logger.info("使用火山引擎 OpenAI 兼容接口：/chat/completions")
+    return volcano_chat_json(prompt, timeout=timeout, max_retries=max_retries)
     bases_to_try = DASHSCOPE_BASES[:]
     while True:
         attempt += 1
@@ -311,7 +282,7 @@ def _normalize_opportunity_keys(d: Dict[str, Any]) -> Dict[str, Any]:
 def analyze_opportunity(clean_text_: str) -> Dict[str, Any]:
     body = clean_text_[:6000]
     prompt = OPPORTUNITY_PROMPT.format(clean_text=body)
-    raw = qwen_chat_json(prompt)
+    raw = llm_chat_json(prompt)
     return _normalize_opportunity_keys(raw)
 
 # ---------------- Supabase IO ----------------
@@ -354,7 +325,7 @@ def upsert_insight(row: Dict[str, Any], clean_txt: str, insight: Dict[str, Any])
         "tags": insight.get("tags") or [],
         "confidence": float(insight.get("confidence") or 0.5),
         "raw_json": insight,
-        "model": QWEN_MODEL,
+        "model": LLM_MODEL,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         # 可选透传
         "title": row.get("title") or insight.get("title") or "",
@@ -400,10 +371,10 @@ def run_pipeline(max_batches: int = MAX_BATCHES, batch_size: int = BATCH_SIZE, s
 
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--batches", type=int, default=MAX_BATCHES)
-    p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    p.add_argument("--sleep", type=float, default=SLEEP_SEC)
+    p = argparse.ArgumentParser(description="机会处理管线：洞察生成、embedding")
+    p.add_argument("--max-batches", "--batches", type=int, default=MAX_BATCHES, dest="batches", help="最多处理批次数")
+    p.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="每批处理条数")
+    p.add_argument("--sleep", type=float, default=SLEEP_SEC, help="两次API调用间的暂停秒数")
     p.add_argument("--all", dest="only_missing", action="store_false", help="不论是否已有洞察，全部重算")
     p.set_defaults(only_missing=ONLY_MISSING)
     p.add_argument("--days", type=int, default=DAYS, help="仅处理最近N天（0=不限）")
@@ -414,7 +385,7 @@ if __name__ == "__main__":
     SLEEP_SEC = args.sleep
     ONLY_MISSING = args.only_missing
     DAYS = args.days
-    logger.info(f"Qwen 模型: {QWEN_MODEL} | 批大小: {BATCH_SIZE} | days={DAYS} | only_missing={ONLY_MISSING}")
+    logger.info(f"大模型: {LLM_MODEL} | 批大小: {BATCH_SIZE} | days={DAYS} | only_missing={ONLY_MISSING}")
     run_pipeline(max_batches=MAX_BATCHES, batch_size=BATCH_SIZE, sleep_sec=SLEEP_SEC, only_missing=ONLY_MISSING)
 
 

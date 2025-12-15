@@ -1,0 +1,22 @@
+[Unit]
+Description=Crawler Refinery Task Scheduler
+After=network.target
+
+[Service]
+Type=simple
+User=chz
+Group=chz
+WorkingDirectory=/Users/chz/code/jobs
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/bin/python3 scheduler.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 安全选项
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
