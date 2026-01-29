@@ -8,10 +8,15 @@ Unified Events → Facts (Qwen3 + Supabase)  — 方案B风格（精简 .env + �
   python databoard-map-process.py --days 7 --batch-size 15 --sleep 0.2 --region cn --fact-table fact_events
 """
 
-import os, re, json, time, random, logging
+import os, re, json, time, random, logging, hashlib
+import sys
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from postgrest.exceptions import APIError  # type: ignore
 from embedding_utils import build_fact_event_embedding
@@ -63,11 +68,16 @@ DAYS_WINDOW         = ""  # 由 --days 设置
 UNIFIED_VIEW        = config.unified_view
 DIM_CN_REGION       = config.dim_cn_region
 DIM_COUNTRY         = config.dim_country
+RAW_NEWS_TABLE      = config.raw_news_table
+RAW_COMPETITOR_TABLE = config.raw_competitors_news_table
+RAW_OPPORTUNITY_TABLE = config.raw_opportunity_table
 STATE_FILE          = ".databoard_map_state.json"
 GEO_BY_LLM          = True
 LOG_LLM             = False
 LOG_GEO             = False
 SUMMARY_PREVIEW_CHARS = 120
+SOURCE_MODE         = "raw"
+ONLY_MISSING        = True
 
 # 关键敏感变量校验
 _missing = [k for k,v in {"SUPABASE_SERVICE_KEY": SUPABASE_KEY, "VOLCANO_API_TOKEN": VOLCANO_API_TOKEN}.items() if not v]
@@ -85,11 +95,16 @@ def parse_args():
     p.add_argument("--max-batches", type=int, default=20, help="最多处理批次数")
     p.add_argument("--sleep", type=float, default=0.4, help="两次 LLM 调用间的暂停秒数")
     p.add_argument("--unified-view", default="v_events_ready", help="读取的统一视图名")
+    p.add_argument("--source-mode", choices=["raw", "view"], default=SOURCE_MODE, help="读取原始表或统一视图")
+    p.add_argument("--news-table", default=RAW_NEWS_TABLE, help="新闻源表")
+    p.add_argument("--competitor-table", default=RAW_COMPETITOR_TABLE, help="竞品新闻源表")
+    p.add_argument("--opportunity-table", default=RAW_OPPORTUNITY_TABLE, help="商机源表")
     p.add_argument("--dim-cn-region", default="dim_cn_region")
     p.add_argument("--dim-country", default="dim_country")
     p.add_argument("--fact-table", default="fact_events")
     p.add_argument("--include-types", default="", help="仅处理这些类型，逗号分隔（可选：news,competitor,opportunity,paper）")
     p.add_argument("--exclude-types", default="", help="排除这些类型，逗号分隔（可选：news,competitor,opportunity,paper）")
+    p.add_argument("--process-all", dest="only_missing", action="store_false", help="不论是否已有结果，全部重算")
     p.add_argument("--geo-by-llm", dest="geo_by_llm", action="store_true", help="优先使用大模型从文本判断国家/省份")
     p.add_argument("--no-geo-by-llm", dest="geo_by_llm", action="store_false", help="关闭基于大模型的地理判断")
     p.add_argument("--log-llm", dest="log_llm", action="store_true", help="输出每条记录的 LLM 摘要/关键词/原始地理判断（实时）")
@@ -101,6 +116,7 @@ def parse_args():
     p.set_defaults(geo_by_llm=True)
     p.set_defaults(log_llm=False)
     p.set_defaults(log_geo=False)
+    p.set_defaults(only_missing=True)
     return p.parse_args()
 
 # Helper: parse comma-separated type list to set, only allow known source types
@@ -112,6 +128,52 @@ def _csv_types_to_set(s: str) -> set:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("unified-events→facts")
 SESSION = requests.Session()
+
+IMG_MD_PATTERN = re.compile(r'!\[[^\]]*\]\([^)]+\)')
+NOISE_RE = re.compile(
+    r'header|footer|logo|search|nav|二维码|微信公众号|移动客户端|/images?/|'
+    r'\.(png|jpg|jpeg|svg)\b|^相关人物$|^下一步$|欢迎访问|统一身份认证|尊敬的用户',
+    re.IGNORECASE
+)
+
+def clean_text(raw: str) -> str:
+    if not raw:
+        return ""
+    lines = [l.strip() for l in str(raw).splitlines()]
+    kept = []
+    for l in lines:
+        l2 = IMG_MD_PATTERN.sub("", l).strip()
+        if not l2 or NOISE_RE.search(l2):
+            continue
+        if len(re.sub(r'[\W_]+', "", l2)) <= 1:
+            continue
+        kept.append(l2)
+    txt = "\n".join(kept)
+    txt = re.sub(r'\n{3,}', '\n\n', txt).strip()
+    txt = re.sub(r'(?m)^(0?\d{1,2})[．\.\s　]+', r'\1. ', txt)
+    return txt
+
+def normalize_news_type(raw_type: str, event_type: str) -> str:
+    r = (raw_type or "").strip()
+    if "竞品" in r:
+        return "竞品新闻"
+    if "商机" in r:
+        return "商机"
+    if "政策" in r or "法规" in r or "条例" in r:
+        return "政策新闻"
+    if r:
+        return "行业新闻"
+    if event_type == "opportunity":
+        return "商机"
+    if event_type == "competitor":
+        return "竞品新闻"
+    if event_type == "news":
+        return "行业新闻"
+    return ""
+
+def _short(s: Optional[str], n: int = 40) -> str:
+    t = (s or "").replace("\n", " ").replace("\r", " ")
+    return (t[:n] + "…") if len(t) > n else t
 
 # ---------------- Supabase 客户端 ----------------
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -134,25 +196,36 @@ def _strip_code_fence_to_json(s: str) -> dict:
         s = s[i:j+1]
     return json.loads(s)
 
-PROMPT_SUMMARY = (
-    "你是一名严谨的中英文信息总结与地理定位助手。无论输入是什么语言，请始终用简体中文输出。"
-    "如果原文为英文论文或英文资讯，请先理解后用中文进行专业概括，不要保留英文句子。"
-    "你必须判断事件发生的国家（优先返回 ISO3，如 CHN/USA/DEU；若不确定，返回 null），不要因为出现中文或中国机构名就默认中国。"
-    
-    "**重要：省份信息提取规则（仅适用于中国）**"
-    "1. **优先从 URL 中提取省份**："
-    "   - 检查 URL 是否包含省份拼音或缩写（如 beijing.gov.cn → 北京市，zj.gov.cn → 浙江省，gd.gov.cn → 广东省）"
-    "   - 检查 URL 是否包含省份中文名（如 ...北京... → 北京市）"
-    "2. **其次从标题中提取**：如果标题包含省份名称（如'北京市'、'广东省'、'浙江省'等）"
-    "3. **最后从正文中提取**：如果正文明确提到省份"
-    "4. 如果确实是全国性政策/论文，可以标注为'全国'或留空"
-    "5. **不要因为政策/论文内容本身没有省份就返回 null，一定要先检查 URL 和标题！**"
-    "6. 对于政策、法规、通知等文档，来源 URL 通常包含省份信息，请仔细检查。"
-    
-    "请仅返回严格的 JSON 对象，字段如下："
-    "{\\\"summary\\\":\\\"<=300字的简体中文摘要\\\",\\\"keywords\\\":[\\\"关键词1\\\",...],\\\"country\\\":\\\"ISO3或国家名(如 CHN/中国/USA/美国)\\\",\\\"province\\\":\\\"中国省级行政区中文名(如 广东省、北京市、全国)，若完全无法判断才留空或null\\\"}。"
-    "请避免臆测；当无法判断时，对应字段置为 null。禁止输出除 JSON 以外的任何内容。"
-)
+PROMPT_SUMMARY = """
+你是一名严谨的中英文信息总结与地理定位助手。无论输入是什么语言，请始终用简体中文输出。
+如果原文为英文论文或英文资讯，请先理解后用中文进行专业概括，不要保留英文句子。
+你必须判断事件发生的国家（优先返回 ISO3，如 CHN/USA/DEU；若不确定，返回 null），不要因为出现中文或中国机构名就默认中国。
+
+重要：省份信息提取规则（仅适用于中国）
+1. 优先从 URL 中提取省份：
+   - 检查 URL 是否包含省份拼音或缩写（如 beijing.gov.cn → 北京市，zj.gov.cn → 浙江省，gd.gov.cn → 广东省）
+   - 检查 URL 是否包含省份中文名（如 ...北京... → 北京市）
+2. 其次从标题中提取：如果标题包含省份名称（如"北京市"、"广东省"、"浙江省"等）
+3. 最后从正文中提取：如果正文明确提到省份
+4. 如果确实是全国性政策/论文，可以标注为"全国"或留空
+5. 不要因为政策/论文内容本身没有省份就返回 null，一定要先检查 URL 和标题
+6. 对于政策、法规、通知等文档，来源 URL 通常包含省份信息，请仔细检查
+
+请仅返回严格 JSON（UTF-8，无注释），字段如下：
+{
+  "summary": "<=300字摘要",
+  "keywords": ["关键词1", "..."],
+  "country": "ISO3或国家名(如 CHN/中国/USA/美国)",
+  "province": "中国省级行政区中文名(如 广东省、北京市、全国)",
+  "short_summary": "<=120字摘要",
+  "long_summary": "200~300字摘要",
+  "bullets": ["要点1", "要点2", "要点3"],
+  "entities": { "org":[], "person":[], "location":[], "date":[] },
+  "ai_suggestion": "<=80字行动建议",
+  "ai_suggestion_full": "150~300字完整建议"
+}
+要求：仅依据输入，不得虚构；保留关键数字与时间；若缺信息填空字符串或空数组；禁止输出除 JSON 以外的任何内容。
+""".strip()
 
 def llm_summary(payload: Dict[str, Any], timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
     """调用火山引擎 /chat/completions，返回 {summary, keywords}，强制 JSON。"""
@@ -249,6 +322,102 @@ def llm_fix_to_zh(result: Dict[str, Any], timeout: int = 40) -> Dict[str, Any]:
                     return json.loads(text[i:j+1])
     # 失败则原样返回
     return result
+
+def _normalize_llm_output(d: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(d, dict):
+        d = {}
+
+    def pick(keys, default=None):
+        for k in keys:
+            if k in d:
+                return d.get(k)
+            for kk in list(d.keys()):
+                if kk.lower() == k.lower():
+                    return d.get(kk)
+        return default
+
+    summary = (pick(["summary"], "") or "").strip()
+    keywords = pick(["keywords"], []) or []
+    country = pick(["country"], None)
+    province = pick(["province"], None)
+    short_summary = (pick(["short_summary", "shortSummary"], "") or "").strip()
+    long_summary = (pick(["long_summary", "longSummary"], "") or "").strip()
+    bullets = pick(["bullets", "points", "key_points", "keyPoints"], []) or []
+    entities = pick(["entities"], {}) or {}
+    ai_suggestion = (pick(["ai_suggestion", "aiSuggestion", "action_suggestion"], "") or "").strip()
+    ai_suggestion_full = (pick(["ai_suggestion_full", "aiSuggestionFull", "action_suggestion_full"], "") or "").strip()
+
+    if not summary and short_summary:
+        summary = short_summary
+
+    if isinstance(keywords, str):
+        try:
+            keywords = json.loads(keywords)
+        except Exception:
+            keywords = []
+    if not isinstance(keywords, list):
+        keywords = []
+    keywords = [str(x).strip() for x in keywords if isinstance(x, (str, int)) and str(x).strip()][:12]
+
+    if isinstance(bullets, str):
+        try:
+            bullets = json.loads(bullets)
+        except Exception:
+            bullets = []
+    if not isinstance(bullets, list):
+        bullets = []
+    cleaned_bullets = []
+    seen = set()
+    for x in bullets:
+        if not isinstance(x, str):
+            continue
+        xx = x.strip()
+        if not xx:
+            continue
+        xx = xx[:40]
+        if xx not in seen:
+            seen.add(xx)
+            cleaned_bullets.append(xx)
+
+    if isinstance(entities, str):
+        try:
+            entities = json.loads(entities)
+        except Exception:
+            entities = {}
+    if not isinstance(entities, dict):
+        entities = {}
+    norm_entities = {}
+    for k in ("org", "person", "location", "date"):
+        arr = entities.get(k) or []
+        if not isinstance(arr, list):
+            arr = []
+        cleaned = []
+        seen_e = set()
+        for v in arr:
+            if not isinstance(v, str):
+                continue
+            vv = v.strip()
+            if not vv or vv in seen_e:
+                continue
+            seen_e.add(vv)
+            cleaned.append(vv)
+        norm_entities[k] = cleaned
+
+    if not ai_suggestion and ai_suggestion_full:
+        ai_suggestion = ai_suggestion_full[:80]
+
+    return {
+        "summary": summary[:300],
+        "keywords": keywords,
+        "country": country,
+        "province": province,
+        "short_summary": short_summary[:120],
+        "long_summary": long_summary[:1200],
+        "bullets": cleaned_bullets,
+        "entities": norm_entities,
+        "ai_suggestion": ai_suggestion[:200],
+        "ai_suggestion_full": ai_suggestion_full[:2000],
+    }
 
 # ---------------- 维表映射 ----------------
 PROV_MAP: Dict[str,str] = {}
@@ -439,6 +608,70 @@ def _compute_since_iso() -> Optional[str]:
     except Exception:
         return None
 
+# ---------------- 读取原始表 ----------------
+def _make_row_hash(src_table: str, src_id: str, url: str) -> str:
+    base = f"{src_table}:{src_id}:{url or ''}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+def fetch_raw_batch(table: str, event_type: str, offset: int, limit: int) -> List[Dict[str,Any]]:
+    q = (
+        sb.table(table)
+        .select("id,title,content,source_url,source_type,news_type,publish_time,created_at")
+        .order("created_at", desc=True)
+        .order("id", desc=True)
+    )
+    if STABLE_SINCE_ISO:
+        q = q.gte("created_at", STABLE_SINCE_ISO)
+    res = q.range(offset, offset + limit - 1).execute()
+    rows = res.data or []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        src_id = str(r.get("id"))
+        source_url = r.get("source_url") or ""
+        published_at = r.get("publish_time") or r.get("created_at")
+        out.append({
+            "type": event_type,
+            "src_id": src_id,
+            "src_table": table,
+            "title": r.get("title") or "",
+            "content": r.get("content") or "",
+            "url": source_url,
+            "source_url": source_url,
+            "source_type": r.get("source_type") or "",
+            "news_type": r.get("news_type") or "",
+            "published_at": published_at,
+            "source": source_url,
+            "row_hash": _make_row_hash(table, src_id, source_url),
+        })
+    return out
+
+def fetch_existing_payload_map(src_table: str, ids: List[str]) -> Dict[str, Any]:
+    if not ids:
+        return {}
+    try:
+        res = (
+            sb.table(FACT_TABLE)
+            .select("src_id,payload")
+            .eq("src_table", src_table)
+            .in_("src_id", ids)
+            .execute()
+        )
+    except Exception:
+        return {}
+    out = {}
+    for r in (res.data or []):
+        out[str(r.get("src_id"))] = r.get("payload")
+    return out
+
+def _has_ready_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    short_summary = (payload.get("short_summary") or "").strip()
+    if short_summary:
+        return True
+    summary = (payload.get("summary") or "").strip()
+    return bool(summary)
+
 # ---------------- 读取统一视图 ----------------
 def fetch_unified_batch(offset: int, limit: int) -> List[Dict[str,Any]]:
     res = (
@@ -480,8 +713,9 @@ def ensure_fact_table_exists_or_die():
         "create table if not exists public.fact_events (\n"
         "  id bigserial primary key,\n"
         "  type text not null,\n"
+        "  news_type text,\n"
         "  title text not null,\n"
-        "  url text not null unique,\n"
+        "  url text not null,\n"
         "  source text,\n"
         "  published_at timestamptz,\n"
         "  country_iso3 text references public.dim_country(iso3),\n"
@@ -495,6 +729,7 @@ def ensure_fact_table_exists_or_die():
         "  created_at timestamptz default now()\n"
         ");\n"
         "create unique index if not exists idx_fact_events_row_hash on public.fact_events(row_hash);\n"
+        "create unique index if not exists idx_fact_events_src on public.fact_events(src_table, src_id);\n"
         "create index if not exists idx_fact_events_pub_at on public.fact_events(published_at desc);\n"
         "create index if not exists idx_fact_events_geo on public.fact_events(country_iso3, province_code);\n"
     )
@@ -503,31 +738,48 @@ def ensure_fact_table_exists_or_die():
 
 # ---------------- 主处理 ----------------
 
-def process_row(row: Dict[str,Any]) -> Dict[str,Any]:
-    # 送入 LLM 的负载（仅用于摘要/关键词）
+def process_row(row: Dict[str,Any]) -> Optional[Dict[str,Any]]:
+    title = (row.get("title") or "").strip()
+    if not title:
+        return None
+    source_url = (row.get("source_url") or row.get("url") or "").strip()
+    if not source_url:
+        return None
+    raw_content = row.get("content") or ""
+    clean = row.get("clean_text") or clean_text(raw_content)
+    if not clean:
+        return None
+
+    event_type = (row.get("type") or "").strip()
+    raw_news_type = (row.get("news_type") or "").strip()
+    news_type = normalize_news_type(raw_news_type, event_type)
+
     payload = {
-        "title": row.get("title"),
-        "content": (row.get("content") or "")[:6000],
-        "url": row.get("url_norm") or row.get("url"),
-        "source": row.get("source"),
-        "type": row.get("type"),
+        "title": title,
+        "content": clean[:6000],
+        "url": source_url,
+        "source": source_url,
+        "type": event_type,
         "time_hint": row.get("published_at")
     }
-    s = llm_summary(payload)
+    s = _normalize_llm_output(llm_summary(payload))
 
     # 强制中文：若摘要不含中文字符，则进行一次 JSON 内值的中文化兜底
     if not _has_chinese(s.get("summary")):
-        s = llm_fix_to_zh(s)
+        s = _normalize_llm_output(llm_fix_to_zh(s))
     # 同时确保关键词为中文（若关键词存在且大多为英文，做一次兜底）
     if isinstance(s.get("keywords"), list):
         joined = " ".join([str(x) for x in s["keywords"]])
-        if not _has_chinese(joined):
-            s = llm_fix_to_zh(s)
+        if joined and not _has_chinese(joined):
+            s = _normalize_llm_output(llm_fix_to_zh(s))
+
+    if not s.get("short_summary") and not s.get("summary"):
+        return None
 
     # ===== 国家与省份推断（优先 LLM，再回退启发式） =====
     country_iso3 = row.get("country_iso3")
     province_code = row.get("province_code")
-    url_for_geo = row.get("url_norm") or row.get("url")
+    url_for_geo = row.get("url_norm") or row.get("url") or source_url
 
     # 0) 尝试从 LLM 结果映射
     geo_source = None
@@ -592,31 +844,46 @@ def process_row(row: Dict[str,Any]) -> Dict[str,Any]:
             country_iso3 = "CHN"
 
     # 可视化：生成摘要预览
-    _summary_preview = (s.get("summary") or "")[:SUMMARY_PREVIEW_CHARS] if isinstance(s, dict) else None
+    _summary_preview = (s.get("summary") or "")[:SUMMARY_PREVIEW_CHARS]
 
     payload_value = {
         "lang_hint": row.get("lang_hint"),
         "geo_source": geo_source,
-        "llm_country": (s.get("country") if isinstance(s, dict) else None),
-        "llm_province": (s.get("province") if isinstance(s, dict) else None),
+        "llm_country": s.get("country"),
+        "llm_province": s.get("province"),
         "summary_preview": _summary_preview,
         "keywords": s.get("keywords"),
+        "summary": s.get("summary"),
+        "short_summary": s.get("short_summary"),
+        "long_summary": s.get("long_summary"),
+        "bullets": s.get("bullets"),
+        "entities": s.get("entities"),
+        "ai_suggestion": s.get("ai_suggestion"),
+        "ai_suggestion_full": s.get("ai_suggestion_full"),
+        "clean_text": clean,
+        "news_type_raw": raw_news_type,
+        "news_type": news_type,
+        "source_type": row.get("source_type") or "",
+        "source_url": source_url,
+        "model": LLM_MODEL,
+        "status": "ok",
     }
 
     embedding = build_fact_event_embedding(
         type_=row.get("type") or "",
-        title=row.get("title") or "",
-        summary=s.get("summary") if isinstance(s, dict) else None,
-        source=row.get("source"),
-        keywords=s.get("keywords") if isinstance(s, dict) else None,
+        title=title,
+        summary=s.get("summary"),
+        source=source_url,
+        keywords=s.get("keywords"),
         payload=payload_value,
     )
 
     rec = {
-        "type": row.get("type"),
-        "title": row.get("title"),
+        "type": event_type,
+        "news_type": news_type,
+        "title": title,
         "url": url_for_geo,
-        "source": row.get("source"),
+        "source": source_url,
         "published_at": row.get("published_at"),
         "country_iso3": country_iso3,
         "province_code": province_code,
@@ -633,7 +900,7 @@ def process_row(row: Dict[str,Any]) -> Dict[str,Any]:
 
 def route_and_insert(rec: Dict[str,Any]) -> str:
     try:
-        sb.table(FACT_TABLE).upsert(rec, on_conflict="url").execute()
+        sb.table(FACT_TABLE).upsert(rec, on_conflict="src_table,src_id").execute()
         return FACT_TABLE
     except APIError as e:
         err = getattr(e, "args", [None])[0] or {}
@@ -666,14 +933,13 @@ def run_once(offset=0, limit=BATCH_SIZE, sleep_sec=SLEEP_BETWEEN_CALLS) -> int:
         log.info("无更多记录。" + (f"（时间窗：近{DAYS_WINDOW}天）" if since_iso else ""))
         return 0
 
-    def _short(s: Optional[str], n: int = 40) -> str:
-        t = (s or "").replace("\n", " ").replace("\r", " ")
-        return (t[:n] + "…") if len(t) > n else t
-
     upserts = 0
     for r in rows:
         try:
             rec = process_row(r)
+            if not rec:
+                log.info(f"[SKIP] 空内容或无效记录 | {r.get('src_table')}:{r.get('src_id')}")
+                continue
             if LOG_LLM:
                 p = rec.get("payload") or {}
                 log.info(
@@ -698,10 +964,63 @@ def run_once(offset=0, limit=BATCH_SIZE, sleep_sec=SLEEP_BETWEEN_CALLS) -> int:
         time.sleep(sleep_sec)
     return upserts
 
+def run_once_raw(
+    table: str,
+    event_type: str,
+    offset: int = 0,
+    limit: int = BATCH_SIZE,
+    sleep_sec: float = SLEEP_BETWEEN_CALLS,
+    only_missing: bool = True,
+) -> int:
+    rows = fetch_raw_batch(table, event_type, offset, limit)
+    if not rows:
+        log.info(f"无更多记录 | {table}({event_type})" + (f"（时间窗：近{DAYS_WINDOW}天）" if STABLE_SINCE_ISO else ""))
+        return 0
+
+    if only_missing:
+        ids = [r["src_id"] for r in rows]
+        existing = fetch_existing_payload_map(table, ids)
+        rows = [r for r in rows if not _has_ready_payload(existing.get(str(r["src_id"])))]
+        if not rows:
+            log.info(f"本批全部已有结果，跳过 | {table}({event_type})")
+            return 0
+
+    upserts = 0
+    for r in rows:
+        try:
+            rec = process_row(r)
+            if not rec:
+                log.info(f"[SKIP] 空内容或无效记录 | {r.get('src_table')}:{r.get('src_id')}")
+                continue
+            if LOG_LLM:
+                p = rec.get("payload") or {}
+                log.info(
+                    f"[LLM] {rec.get('type')} | {_short(rec.get('title'), 40)} | news_type={rec.get('news_type')} | kw={','.join((rec.get('keywords') or [])[:5]) if isinstance(rec.get('keywords'), list) else ''} | sum={_short(p.get('summary_preview'), SUMMARY_PREVIEW_CHARS)}"
+                )
+            where = route_and_insert(rec)
+            if where == "fact_events":
+                upserts += 1
+            if LOG_GEO:
+                p = rec.get("payload") or {}
+                if rec.get('country_iso3') and rec.get('country_iso3') != 'CHN':
+                    log.info(
+                        f"[GEO] iso3={rec.get('country_iso3')} | prov={rec.get('province_code')} | source={p.get('geo_source')} | url={_short(rec.get('url'), 80)}"
+                    )
+                else:
+                    log.info(
+                        f"[GEO] iso3={rec.get('country_iso3')} | prov={rec.get('province_code')} | source={p.get('geo_source')}"
+                    )
+            log.info(f"[upsert] fact_events | {rec.get('type')} | {_short(rec.get('title'), 40)}")
+        except Exception as e:
+            log.exception(f"处理失败: {r.get('src_table')}:{r.get('src_id')} | {e}")
+        time.sleep(sleep_sec)
+    return upserts
+
 def main():
     global PROV_MAP, COUNTRY_MAP
     args = parse_args()
     global UNIFIED_VIEW, DIM_CN_REGION, DIM_COUNTRY, BATCH_SIZE, MAX_BATCHES, SLEEP_BETWEEN_CALLS, DAYS_WINDOW, FACT_TABLE, GEO_BY_LLM, LOG_LLM, LOG_GEO, SUMMARY_PREVIEW_CHARS
+    global RAW_NEWS_TABLE, RAW_COMPETITOR_TABLE, RAW_OPPORTUNITY_TABLE, SOURCE_MODE, ONLY_MISSING
     UNIFIED_VIEW = args.unified_view
     DIM_CN_REGION = args.dim_cn_region
     DIM_COUNTRY = args.dim_country
@@ -710,6 +1029,11 @@ def main():
     SLEEP_BETWEEN_CALLS = args.sleep
     DAYS_WINDOW = str(args.days or "").strip()
     FACT_TABLE = args.fact_table
+    RAW_NEWS_TABLE = args.news_table
+    RAW_COMPETITOR_TABLE = args.competitor_table
+    RAW_OPPORTUNITY_TABLE = args.opportunity_table
+    SOURCE_MODE = args.source_mode
+    ONLY_MISSING = bool(args.only_missing)
     GEO_BY_LLM = bool(args.geo_by_llm)
     LOG_LLM = bool(args.log_llm)
     LOG_GEO = bool(args.log_geo)
@@ -731,6 +1055,7 @@ def main():
     log.info(f"LLM 使用模型: {LLM_MODEL}（来源: {model_src}）, 地理由LLM={GEO_BY_LLM}")
     log.info(f"可视化: log_llm={LOG_LLM}, log_geo={LOG_GEO}, summary_chars={SUMMARY_PREVIEW_CHARS}")
     log.info(f"LLM 端点: {VOLCANO_API_ENDPOINT}/chat/completions")
+    log.info(f"source_mode={SOURCE_MODE} | only_missing={ONLY_MISSING}")
 
     # 批处理中保持稳定的时间窗起点（一次计算，多批复用）
     global STABLE_SINCE_ISO
@@ -749,15 +1074,43 @@ def main():
     PROV_NAME_RE = _cn_prov_regex()
     if not COUNTRY_MAP:
         log.warning("dim_country 为空：将忽略任何 country_iso3 写入以避免外键错误。建议先填充 dim_country（至少 CHN/USA/DEU 等）。")
-    # 批量循环
-    offset = 0
     total = 0
-    for _ in range(MAX_BATCHES):
-        n = run_once(offset=offset, limit=BATCH_SIZE, sleep_sec=SLEEP_BETWEEN_CALLS)
-        if n == 0 and offset > 0:
-            break
-        offset += BATCH_SIZE
-        total += n
+    if SOURCE_MODE == "view":
+        offset = 0
+        for _ in range(MAX_BATCHES):
+            n = run_once(offset=offset, limit=BATCH_SIZE, sleep_sec=SLEEP_BETWEEN_CALLS)
+            if n == 0 and offset > 0:
+                break
+            offset += BATCH_SIZE
+            total += n
+    else:
+        source_specs = [
+            ("news", RAW_NEWS_TABLE),
+            ("competitor", RAW_COMPETITOR_TABLE),
+            ("opportunity", RAW_OPPORTUNITY_TABLE),
+        ]
+        for event_type, table in source_specs:
+            if TYPE_FILTER_INCLUDE and event_type not in TYPE_FILTER_INCLUDE:
+                continue
+            if TYPE_FILTER_EXCLUDE and event_type in TYPE_FILTER_EXCLUDE:
+                continue
+            offset = 0
+            total_type = 0
+            for _ in range(MAX_BATCHES):
+                n = run_once_raw(
+                    table=table,
+                    event_type=event_type,
+                    offset=offset,
+                    limit=BATCH_SIZE,
+                    sleep_sec=SLEEP_BETWEEN_CALLS,
+                    only_missing=ONLY_MISSING,
+                )
+                if n == 0 and offset > 0:
+                    break
+                offset += BATCH_SIZE
+                total_type += n
+            log.info(f"{event_type} 写入 {total_type} 条")
+            total += total_type
     log.info(f"结束：累计写入 {total} 条")
 
 if __name__ == "__main__":

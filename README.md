@@ -1,6 +1,6 @@
 # 数据处理脚本配置说明
 
-本仓库包含若干 Python 脚本，用于从内部视图读取事件/新闻/商机数据，经火山引擎 LLM 与 Qwen Embedding 处理后写回 Supabase。配置与运行参数分离，便于快速调整。支持定时自动调度执行。
+本仓库包含若干 Python 脚本，用于从原始表读取事件/新闻/商机数据，经火山引擎 LLM 与 Qwen Embedding 处理后写回 Supabase（统一落到 fact_events）。配置与运行参数分离，便于快速调整。支持定时自动调度执行。
 
 ## 目录结构
 
@@ -17,7 +17,7 @@ jobs/
 │   ├── news_process.py          # 新闻清洗、摘要
 │   ├── opportunity-process.py   # 商机清洗、摘要
 │   ├── daily-report-process.py  # 竞争情报/日报摘要
-│   ├── databoard-map-process.py # 统一事件视图 → fact_events 加工
+│   ├── databoard-map-process.py # 原始表 → fact_events（含新闻摘要/建议/地理/向量）
 │   ├── backfill-embeddings.py   # 补充缺失的 embedding 向量
 │   └── embedding_utils.py       # Qwen text-embedding-v4 封装
 │
@@ -61,12 +61,13 @@ cp env.example .env
 # 日报处理
 python scripts/daily-report-process.py
 
-# 统一事件 → fact_events（可指定时间窗、批次）
+# 统一处理（RAW 默认：00_news / 00_competitors_news / 00_opportunity）
 python scripts/databoard-map-process.py --days 7 --batch-size 15 --sleep 0.2
 
-# 新闻 / 商机处理
-python scripts/news_process.py
-python scripts/opportunity-process.py
+# 仅处理某一类（可选）
+python scripts/databoard-map-process.py --days 7 --include-types news
+python scripts/databoard-map-process.py --days 7 --include-types competitor
+python scripts/databoard-map-process.py --days 7 --include-types opportunity
 
 # 补充缺失的 embedding
 python scripts/backfill-embeddings.py --batch-size 50 --max-batches 100
@@ -91,6 +92,10 @@ BATCH_SIZE=10 MAX_BATCHES=1 DEBUG=1 python daily-report-process.py
 - `VIEW=management|market|sales|product`
 - `DAYS`、`BATCH_SIZE`、`MAX_BATCHES`、`SLEEP_SEC`
 - `FORCE_REFRESH`、`ENABLE_NOISE_FILTER`、`DEBUG`
+
+fact_events 相关：
+- `databoard-map-process.py` 会直接写入 `fact_events`
+- `news_type` 为单独列，可直接 SQL 过滤
 
 ---
 
@@ -140,53 +145,35 @@ scheduler:
   # 任务定义
   jobs:
     news_process:
-      enabled: true
+      enabled: false
       cron: "0 8 * * *"
-      script: "news_process.py"
+      script: "scripts/news_process.py"
       days: 3             # 覆盖默认值
       batch_size: 30
       timeout: 1800       # 30分钟超时
       retry_on_fail: true # 启用重试
     
     opportunity_process:
-      enabled: true
+      enabled: false
       cron: "0 9 * * *"
-      script: "opportunity-process.py"
+      script: "scripts/opportunity-process.py"
       days: 7
       retry_on_fail: true
     
     databoard_map_hourly:
       enabled: true
       cron: "30 * * * *"
-      script: "databoard-map-process.py"
+      script: "scripts/databoard-map-process.py"
       days: 1
       batch_size: 20
       max_batches: 5
+      args: ["--source-mode", "raw"]
     
     daily_report:
       enabled: true
       cron: "0 23 * * *"
-      script: "daily-report-process.py"
+      script: "scripts/daily-report-process.py"
       args: ["--mode", "daily"]
-```
-    news_process:
-      enabled: true
-      cron: "0 8 * * *"        # 每天 08:00
-      script: "news_process.py"
-      args: []
-    opportunity_process:
-      enabled: true
-      cron: "0 9 * * *"        # 每天 09:00
-      script: "opportunity-process.py"
-    databoard_map_hourly:
-      enabled: true
-      cron: "30 * * * *"       # 每小时 30 分
-      script: "databoard-map-process.py"
-      args: ["--days", "1", "--batch-size", "20"]
-    daily_report:
-      enabled: true
-      cron: "0 23 * * *"       # 每天 23:00
-      script: "daily-report-process.py"
 ```
 
 ### 调度器命令

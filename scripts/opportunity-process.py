@@ -28,8 +28,14 @@ import json
 import time
 import random
 import logging
+import sys
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import requests
 SESSION = requests.Session()
@@ -387,5 +393,4 @@ if __name__ == "__main__":
     DAYS = args.days
     logger.info(f"大模型: {LLM_MODEL} | 批大小: {BATCH_SIZE} | days={DAYS} | only_missing={ONLY_MISSING}")
     run_pipeline(max_batches=MAX_BATCHES, batch_size=BATCH_SIZE, sleep_sec=SLEEP_SEC, only_missing=ONLY_MISSING)
-
 

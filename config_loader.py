@@ -106,6 +106,10 @@ class Config:
     @property
     def raw_news_table(self) -> str:
         return self.get('tables.raw_news_table', '00_news')
+
+    @property
+    def raw_competitors_news_table(self) -> str:
+        return self.get('tables.raw_competitors_news_table', '00_competitors_news')
     
     @property
     def raw_opportunity_table(self) -> str:
@@ -130,6 +134,18 @@ class Config:
     @property
     def opportunity_insights_table(self) -> str:
         return self.get('tables.opportunity_insights_table', 'opportunity_insights')
+
+    @property
+    def bid_monthly_table(self) -> str:
+        return self.get('tables.bid_monthly_table', '11_bid')
+
+    @property
+    def industry_news_monthly_table(self) -> str:
+        return self.get('tables.industry_news_monthly_table', '11_industry_news')
+
+    @property
+    def policy_news_monthly_table(self) -> str:
+        return self.get('tables.policy_news_monthly_table', '11_policy_news')
     
     @property
     def monthly_days(self) -> int:
@@ -269,4 +285,3 @@ class Config:
 
 # 全局配置实例
 config = Config()
-

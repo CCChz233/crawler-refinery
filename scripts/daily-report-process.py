@@ -29,13 +29,19 @@ python daily-report-process.py
 
 import os
 import re
+import sys
 import json
 import time
 import random
 import logging
 import hashlib
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Tuple, Set, Optional
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import requests
 from supabase import create_client, Client
@@ -53,6 +59,7 @@ LLM_MODEL = config.llm_model
 LLM_TEMPERATURE = config.llm_temperature
 # Qwen API 配置（仅用于 Embedding）
 QWEN_API_KEY  = config.qwen_api_key
+QWEN_MODEL = LLM_MODEL
 ENABLE_NOISE_FILTER = config.enable_noise_filter
 
 # 业务配置（从 config.yaml 读取）
@@ -63,6 +70,7 @@ MAX_BATCHES   = config.max_batches
 SLEEP_SEC     = config.sleep_sec
 FORCE_REFRESH = config.force_refresh
 DEBUG         = config.debug
+_ENV_BATCH = os.getenv("BATCH_SIZE")
 
 ANALYSIS_TABLE = config.analysis_table
 SOURCE_TABLE = (ANALYSIS_TABLE or "").lower()
@@ -449,6 +457,55 @@ def _normalize_llm_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
         obj["confidence"] = 0.5
     return obj
 
+def _normalize_sources_list(sources: Any, max_items: int = 5) -> List[Dict[str, str]]:
+    if isinstance(sources, str):
+        try:
+            sources = json.loads(sources)
+        except Exception:
+            return []
+    if not isinstance(sources, list):
+        return []
+    cleaned: List[Dict[str, str]] = []
+    seen = set()
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url") or item.get("link")
+        if not isinstance(url, str):
+            continue
+        url = url.strip()
+        if not url or url in seen:
+            continue
+        title = item.get("title") or item.get("name") or "来源"
+        if not isinstance(title, str):
+            title = "来源"
+        title = title.strip() or "来源"
+        cleaned.append({"title": title[:120], "url": url})
+        seen.add(url)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+def _build_sources_from_events(events: List[Dict[str, Any]], max_items: int = 5) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for ev in events:
+        url = ev.get("url")
+        if not isinstance(url, str):
+            continue
+        url = url.strip()
+        if not url or url in seen:
+            continue
+        title = ev.get("source") or ev.get("title") or "来源"
+        if not isinstance(title, str):
+            title = "来源"
+        title = title.strip() or "来源"
+        out.append({"title": title[:120], "url": url})
+        seen.add(url)
+        if len(out) >= max_items:
+            break
+    return out
+
 def _parse_qwen_json(text: str) -> Dict[str, Any]:
     try:
         obj = json.loads(_extract_json_object_text(text))
@@ -473,6 +530,9 @@ def llm_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[
     """调用大模型API（火山引擎），返回JSON格式结果"""
     logger.info("使用火山引擎 OpenAI 兼容接口：/chat/completions")
     return volcano_chat_json(prompt, timeout=timeout, max_retries=max_retries)
+
+def qwen_chat_json(prompt: str, timeout: int = 60, max_retries: int = 6) -> Dict[str, Any]:
+    return llm_chat_json(prompt, timeout=timeout, max_retries=max_retries)
 
 # ---------------- Supabase IO ----------------
 def fetch_analysis_batch(offset: int, limit: int, days: int = DAYS) -> List[Dict[str, Any]]:
@@ -1596,6 +1656,17 @@ def run_monthly_summary():
             llm_out = qwen_chat_json(prompt)
             if isinstance(llm_out, dict):
                 llm_out["category"] = category_name
+                cleaned_sources = _normalize_sources_list(llm_out.get("sources"))
+                if cleaned_sources:
+                    llm_out["sources"] = cleaned_sources
+                else:
+                    fallback_sources = _build_sources_from_events(events)
+                    if fallback_sources:
+                        llm_out["sources"] = fallback_sources
+                    else:
+                        logger.warning(
+                            f"[MONTHLY][WARN] sources empty after fallback | category={category_name} events={len(events)}"
+                        )
             upsert_monthly_row(category_name, llm_out, MONTHLY_DAYS, len(events))
             logger.info(f"✅ 月度汇总写入：{category_name} | 事件数={len(events)} | 表={MONTHLY_TABLE}")
         except Exception as e:

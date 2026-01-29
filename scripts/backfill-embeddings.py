@@ -23,8 +23,14 @@
 import os
 import time
 import logging
+import sys
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from supabase import create_client, Client
 from config_loader import config

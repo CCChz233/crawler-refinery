@@ -5,9 +5,16 @@ Embedding helpers for fact_events using DashScope (Qwen) text-embedding-v4.
 
 import json
 import logging
+import sys
 from typing import Any, List, Optional
+from pathlib import Path
 
 import dashscope
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from config_loader import config
 
 logger = logging.getLogger(__name__)

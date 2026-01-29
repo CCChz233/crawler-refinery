@@ -25,7 +25,7 @@ processing:
   # 噪声过滤（true/false）
   enable_noise_filter: false
   # 运行模式：daily/weekly/monthly
-  mode: daily
+  mode: monthly
 
 # ============================================
 # 数据表配置
@@ -39,6 +39,7 @@ tables:
   monthly_source_table: fact_events
   # 原始数据表
   raw_news_table: "00_news"
+  raw_competitors_news_table: "00_competitors_news"
   raw_opportunity_table: "00_opportunity"
   competitors_table: "00_competitors"
   # 目标表
@@ -46,6 +47,9 @@ tables:
   weekly_reports_table: dashboard_weekly_reports
   news_summaries_table: news_summaries
   opportunity_insights_table: opportunity_insights
+  bid_monthly_table: "11_bid"
+  industry_news_monthly_table: "11_industry_news"
+  policy_news_monthly_table: "11_policy_news"
 
 # ============================================
 # 月度汇总配置
@@ -128,7 +132,7 @@ scheduler:
   jobs:
     # 新闻处理任务
     news_process:
-      enabled: true
+      enabled: false               # 统一改由 databoard-map-process 处理
       cron: "0 8 * * *"           # 每天早上 8 点
       script: "scripts/news_process.py"
       days: 7                      # 处理最近 7 天的数据
@@ -139,7 +143,7 @@ scheduler:
 
     # 商机处理任务
     opportunity_process:
-      enabled: true
+      enabled: false               # 统一改由 databoard-map-process 处理
       cron: "0 9 * * *"           # 每天早上 9 点
       script: "scripts/opportunity-process.py"
       days: 7                      # 处理最近 7 天的数据
@@ -158,6 +162,7 @@ scheduler:
       max_batches: 20
       timeout: 2400                # 40 分钟超时
       retry_on_fail: true
+      args: ["--source-mode", "raw"]
 
     # 日报生成任务
     daily_report:
@@ -179,3 +184,13 @@ scheduler:
       timeout: 7200                # 2 小时超时
       retry_on_fail: false         # 回填任务不重试
 
+    # 月度系列汇总任务（每日更新）
+    monthly_series_daily:
+      enabled: true
+      cron: "0 4 * * *"           # 每天凌晨 4 点
+      script: "scripts/monthly-series-process.py"
+      days: 90                     # 汇总最近 3 个月
+      batch_size: 100
+      max_batches: 50
+      timeout: 1800                # 30 分钟超时
+      retry_on_fail: true
