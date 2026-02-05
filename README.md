@@ -14,11 +14,13 @@ jobs/
 ├── README.md
 │
 ├── scripts/                 # 业务脚本
+│   ├── catch-up.py              # 统一补齐入口（按顺序串行执行各脚本）
 │   ├── news_process.py          # 新闻清洗、摘要
 │   ├── opportunity-process.py   # 商机清洗、摘要
 │   ├── daily-report-process.py  # 竞争情报/日报摘要
 │   ├── databoard-map-process.py # 原始表 → fact_events（含新闻摘要/建议/地理/向量）
 │   ├── backfill-embeddings.py   # 补充缺失的 embedding 向量
+│   ├── monthly-series-process.py# 00_* → 11_* 月度序列统计
 │   └── embedding_utils.py       # Qwen text-embedding-v4 封装
 │
 ├── utils/                   # 公共工具模块
@@ -56,6 +58,29 @@ cp env.example .env
 
 ### 4. 运行脚本
 
+#### 统一补齐（推荐）
+```bash
+# 默认：按顺序补齐缺失数据（不重算已有结果）
+python scripts/catch-up.py --days 0 --batch-size 40 --max-batches 10000
+
+# 只跑部分步骤（逗号分隔）
+python scripts/catch-up.py --steps databoard_map,news,opportunity
+
+# 试运行（只打印命令）
+python scripts/catch-up.py --dry-run
+
+# 强制重算（会覆盖已有结果）
+python scripts/catch-up.py --process-all
+```
+
+默认步骤顺序：
+`databoard_map → news → opportunity → daily_report → backfill_embeddings → monthly_series`
+
+> 说明：
+> - `--days 0` 表示不限时间窗。
+> - `--max-batches` 需要给正整数（`monthly_series` 支持 0=不限制，其它脚本不支持）。
+> - `daily-report-process.py` 的批次参数在运行时通过环境变量读取；`catch-up.py` 已自动设置。
+
 #### 手动运行单个脚本
 ```bash
 # 日报处理
@@ -73,11 +98,14 @@ python scripts/databoard-map-process.py --days 7 --include-types opportunity
 python scripts/backfill-embeddings.py --batch-size 50 --max-batches 100
 python scripts/backfill-embeddings.py --days 30  # 只处理最近30天
 python scripts/backfill-embeddings.py --dry-run  # 试运行
+
+# 00_* → 11_* 月度统计
+python scripts/monthly-series-process.py --days 0 --batch-size 100 --max-batches 10000
 ```
 
 #### 调试模式（小批次验证）
 ```bash
-BATCH_SIZE=10 MAX_BATCHES=1 DEBUG=1 python daily-report-process.py
+BATCH_SIZE=10 MAX_BATCHES=1 DEBUG=1 python scripts/daily-report-process.py
 ```
 
 ## 配置说明
@@ -224,27 +252,96 @@ tail -f logs/daily_report.log
 
 ## 生产部署
 
-### Linux (systemd)
+### Linux (systemd) 快速部署
 
-1. 编辑 `deployment/crawler-refinery.service`：
-   - 修改 `User` 和 `Group` 为你的用户名
-   - 修改 `WorkingDirectory` 为项目绝对路径
-   - 修改 `ExecStart` 中的 Python 路径
+完整服务器部署文档见：`deployment/SERVER_DEPLOYMENT.md`
+Docker 部署见：`deployment/DOCKER_DEPLOYMENT.md`
 
-2. 安装并启动服务：
+下面是面向服务器的最短可用流程。将路径和用户替换为你的实际值。
+
+1. 创建目录并安装依赖
+```bash
+mkdir -p /opt/jobs
+cd /opt/jobs
+# 假设代码已放到 /opt/jobs
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+2. 配置环境变量
+```bash
+cp env.example .env
+# 编辑 .env，填写 SUPABASE_URL / SUPABASE_SERVICE_KEY / VOLCANO_API_TOKEN / QWEN_API_KEY
+```
+
+3. 校验配置与任务
+```bash
+source .venv/bin/activate
+python scheduler.py --list
+# 可选：先手动跑一个任务验证
+python scheduler.py --test databoard_map_hourly
+```
+
+4. 部署后立即处理所有任务（可选）
+```bash
+source .venv/bin/activate
+python scripts/catch-up.py --days 0 --batch-size 40 --max-batches 10000
+```
+
+5. 配置 systemd 服务
+推荐使用一个专用 service 文件（可在 `deployment/crawler-refinery.service` 基础上修改）。
+
+**推荐模板（示例）**：
+```ini
+[Unit]
+Description=Crawler Refinery Task Scheduler
+After=network.target
+
+[Service]
+Type=simple
+User=jobs
+Group=jobs
+WorkingDirectory=/opt/jobs
+EnvironmentFile=/opt/jobs/.env
+ExecStart=/opt/jobs/.venv/bin/python /opt/jobs/scheduler.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+将其保存为 `/etc/systemd/system/crawler-refinery.service`，然后执行：
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start crawler-refinery
+sudo systemctl enable crawler-refinery
+```
+
+6. 查看状态与日志
+```bash
+sudo systemctl status crawler-refinery
+sudo journalctl -u crawler-refinery -f
+```
+
+> 注意：
+> - `.env` 必须可被 `systemd` 读取，推荐使用 `EnvironmentFile=/opt/jobs/.env`。
+> - 若使用 venv，请确保 `ExecStart` 指向 venv 的 python。
+> - `config.yaml` 中的 `scheduler.*` 决定定时任务与时区。
+
+如果你更倾向直接改模板文件：
 ```bash
 sudo cp deployment/crawler-refinery.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl start crawler-refinery
-sudo systemctl enable crawler-refinery  # 开机自启动
-```
-
-3. 管理服务：
-```bash
-sudo systemctl status crawler-refinery   # 查看状态
-sudo journalctl -u crawler-refinery -f   # 查看日志
-sudo systemctl restart crawler-refinery  # 重启
-sudo systemctl stop crawler-refinery     # 停止
+sudo systemctl enable crawler-refinery
+sudo journalctl -u crawler-refinery -f
 ```
 
 ### macOS (launchd)

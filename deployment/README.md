@@ -16,7 +16,7 @@
 
 1. 根据你的系统选择对应的配置文件
 2. 修改文件中的以下路径：
-   - Python 解释器路径（使用 `which python3` 查看）
+   - Python 解释器路径（建议指向 venv）
    - 项目工作目录路径
    - 用户名/组名（Linux）
 3. 确保 `.env` 文件已配置正确
@@ -24,7 +24,44 @@
 
 ## 部署步骤
 
-详细的部署步骤请参考项目根目录的 `README.md` 中的"定时调度服务 > 生产部署"章节。
+详细的部署步骤请参考 `deployment/SERVER_DEPLOYMENT.md`、`deployment/DOCKER_DEPLOYMENT.md` 或项目根目录的 `README.md` 中的"生产部署"章节。
+
+## systemd 推荐模板
+
+建议使用 `EnvironmentFile` 明确加载 `.env`，并使用 venv 的 Python。
+
+```ini
+[Unit]
+Description=Crawler Refinery Task Scheduler
+After=network.target
+
+[Service]
+Type=simple
+User=jobs
+Group=jobs
+WorkingDirectory=/opt/jobs
+EnvironmentFile=/opt/jobs/.env
+ExecStart=/opt/jobs/.venv/bin/python /opt/jobs/scheduler.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+部署命令：
+```bash
+sudo cp deployment/crawler-refinery.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start crawler-refinery
+sudo systemctl enable crawler-refinery
+sudo journalctl -u crawler-refinery -f
+```
 
 ## 注意事项
 

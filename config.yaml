@@ -175,7 +175,7 @@ scheduler:
 
     # 每周 Embedding 回填任务
     backfill_embeddings_weekly:
-      enabled: false               # 默认关闭，按需开启
+      enabled: true                # 默认开启（按需可关闭）
       cron: "0 2 * * 0"           # 每周日凌晨 2 点
       script: "scripts/backfill-embeddings.py"
       days: 7                      # 回填最近 7 天

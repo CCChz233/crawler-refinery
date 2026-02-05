@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  jobs-scheduler:
+    build: .
+    image: jobs-scheduler:latest
+    container_name: jobs-scheduler
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs
+    working_dir: /app
+    command: ["python", "scheduler.py"]
